@@ -1,0 +1,6 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "python bots/alpaca_bot.py & python bots/kalshi_btc_bot.py & python bots/kalshi_arb_bot.py & python bots/research_service.py & wait"
+restartPolicyType = "always"
