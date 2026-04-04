@@ -97,6 +97,12 @@ class AlpacaClient:
             )
             return r.json()
 
+    async def is_market_open(self) -> bool:
+        """Check Alpaca clock API — respects weekends and holidays."""
+        async with httpx.AsyncClient() as c:
+            r = await c.get(f"{self.base_url}/v2/clock", headers=self.headers, timeout=10)
+            return r.json().get("is_open", False)
+
 
 # ─── TECHNICAL ANALYSIS ───────────────────────────────────────────
 def calculate_ema(prices: list, period: int) -> list:
@@ -410,23 +416,21 @@ async def main():
 
     while True:
         now = datetime.now(timezone.utc)
-        hour = now.hour
 
-        # Only trade during market hours (approx 13:30-20:00 UTC = 9:30-4:00 ET)
-        if 13 <= hour <= 20:
-            print(f"\n[{now.strftime('%H:%M:%S')}] Running scan cycle...")
+        market_open = await client.is_market_open()
+
+        if market_open:
+            print(f"\n[{now.strftime('%H:%M:%S')}] Market open — running scan cycle...")
             try:
                 await run_scan_cycle(client, risk)
                 await manage_positions(client)
             except Exception as e:
                 print(f"Cycle error: {e}")
                 send_alert(BOT_ID, "ERROR", f"Scan cycle error: {e}")
+            await asyncio.sleep(900)  # 15 min during market hours
         else:
-            print(f"[{now.strftime('%H:%M:%S')}] Market closed. Sleeping...")
-
-        # Run every 15 minutes during market hours, 60 min otherwise
-        sleep_time = 900 if 13 <= hour <= 20 else 3600
-        await asyncio.sleep(sleep_time)
+            print(f"[{now.strftime('%H:%M:%S')}] Market closed. Sleeping 60 min...")
+            await asyncio.sleep(3600)  # 60 min when closed
 
 
 if __name__ == "__main__":
