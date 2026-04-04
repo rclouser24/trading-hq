@@ -253,8 +253,9 @@ async def main():
         balance = await client.get_balance()
         print(f"   Balance: ${balance:,.2f}")
     except Exception as e:
+        import traceback
         print(f"   Auth error: {e}")
-        print(f"   Running in monitor-only mode until auth is fixed.")
+        print(f"   Traceback: {traceback.format_exc()}")
         balance = 0
 
     while True:
