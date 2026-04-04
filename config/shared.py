@@ -17,8 +17,21 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 
 KALSHI_KEY_ID = os.environ.get("KALSHI_KEY_ID", "")
-# Support both literal \n (Railway single-line) and actual newlines
-KALSHI_PRIVATE_KEY = os.environ.get("KALSHI_PRIVATE_KEY", "").replace("\\n", "\n")
+# Normalize PEM key: handle literal \n and reformat continuous base64 body
+def _normalize_pem(raw: str) -> str:
+    if not raw:
+        return raw
+    raw = raw.replace("\\n", "\n").strip()
+    # Extract header, body, footer
+    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+    header = lines[0]   # -----BEGIN RSA PRIVATE KEY-----
+    footer = lines[-1]  # -----END RSA PRIVATE KEY-----
+    body = "".join(lines[1:-1])  # join all middle lines (handles both formats)
+    # Re-wrap body at 64 chars per line as PEM requires
+    wrapped = "\n".join(body[i:i+64] for i in range(0, len(body), 64))
+    return f"{header}\n{wrapped}\n{footer}\n"
+
+KALSHI_PRIVATE_KEY = _normalize_pem(os.environ.get("KALSHI_PRIVATE_KEY", ""))
 
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
