@@ -2,5 +2,5 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "python bots/kalshi_btc_bot.py"
+startCommand = "python start.py"
 restartPolicyType = "always"
