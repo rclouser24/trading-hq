@@ -17,7 +17,8 @@ SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 
 KALSHI_KEY_ID = os.environ.get("KALSHI_KEY_ID", "")
-KALSHI_PRIVATE_KEY = os.environ.get("KALSHI_PRIVATE_KEY", "")
+# Support both literal \n (Railway single-line) and actual newlines
+KALSHI_PRIVATE_KEY = os.environ.get("KALSHI_PRIVATE_KEY", "").replace("\\n", "\n")
 
 ALPACA_API_KEY = os.environ.get("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY", "")
