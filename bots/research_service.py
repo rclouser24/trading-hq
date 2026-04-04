@@ -5,12 +5,28 @@ Runs scheduled queries and caches results for all bots + dashboard.
 import os
 import sys
 import asyncio
+import httpx
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.shared import (
+    ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL,
     supabase, log_research, query_perplexity, get_bot_state,
 )
+
+ALPACA_HEADERS = {
+    "APCA-API-KEY-ID": ALPACA_API_KEY,
+    "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+}
+
+async def is_market_open() -> bool:
+    """Check Alpaca clock — respects weekends and holidays."""
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(f"{ALPACA_BASE_URL}/v2/clock", headers=ALPACA_HEADERS, timeout=10)
+            return r.json().get("is_open", False)
+    except Exception:
+        return False
 
 # ─── SCHEDULED QUERIES ────────────────────────────────────────────
 SCHEDULES = [
@@ -107,24 +123,35 @@ async def main():
     while True:
         now = datetime.now(timezone.utc)
         now_ts = now.timestamp()
-        print(f"\n[{now.strftime('%H:%M:%S')}] Research cycle...")
+        market_open = await is_market_open()
+        print(f"\n[{now.strftime('%H:%M:%S')}] Research cycle... (market {'open' if market_open else 'closed'})")
 
-        # Run scheduled queries
+        # Crypto queries run 24/7 regardless of market hours
         for schedule in SCHEDULES:
+            is_crypto_query = any(b in schedule["relevant_bots"] for b in ["kalshi_btc", "kalshi_arb"])
+            is_stock_query = "alpaca" in schedule["relevant_bots"] and not is_crypto_query
+
+            # Skip stock-only queries when market is closed
+            if is_stock_query and not market_open:
+                continue
+
             elapsed = (now_ts - schedule["last_run"]) / 60
             if elapsed >= schedule["interval_minutes"]:
                 await run_scheduled_query(schedule)
                 schedule["last_run"] = now_ts
                 await asyncio.sleep(2)  # Rate limiting
 
-        # Run ticker-specific queries
-        ticker_elapsed = (now_ts - last_ticker_run) / 60
-        if ticker_elapsed >= TICKER_INTERVAL_MINUTES:
-            print(f"\n  Running watchlist scan...")
-            for ticker in WATCHLIST_TICKERS:
-                await run_ticker_query(ticker)
-                await asyncio.sleep(3)  # Rate limiting between tickers
-            last_ticker_run = now_ts
+        # Ticker scans only when market is open
+        if market_open:
+            ticker_elapsed = (now_ts - last_ticker_run) / 60
+            if ticker_elapsed >= TICKER_INTERVAL_MINUTES:
+                print(f"\n  Running watchlist scan...")
+                for ticker in WATCHLIST_TICKERS:
+                    await run_ticker_query(ticker)
+                    await asyncio.sleep(3)  # Rate limiting between tickers
+                last_ticker_run = now_ts
+        else:
+            print(f"  Skipping stock ticker scans (market closed).")
 
         # Sleep 5 minutes between cycles
         print(f"\n  Next cycle in 5 minutes...")
