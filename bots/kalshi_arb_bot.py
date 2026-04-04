@@ -72,7 +72,11 @@ class KalshiArbClient:
         path = "/portfolio/balance"
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{self.base}{path}", headers=kalshi_headers("GET", path), timeout=5)
-            return r.json().get("balance", 0) / 100
+            data = r.json()
+            # Kalshi returns balance (cash) + portfolio_value (open positions) in cents
+            cash = data.get("balance", 0)
+            positions = data.get("portfolio_value", 0)
+            return (cash + positions) / 100
 
     async def get_orderbook(self, ticker: str) -> dict:
         path = f"/markets/{ticker}/orderbook"

@@ -68,8 +68,10 @@ class KalshiClient:
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{self.base}{path}", headers=kalshi_headers("GET", path), timeout=10)
             data = r.json()
-            # Kalshi returns balance in cents
-            return data.get("balance", 0) / 100
+            # Kalshi returns balance (cash) + portfolio_value (open positions) in cents
+            cash = data.get("balance", 0)
+            positions = data.get("portfolio_value", 0)
+            return (cash + positions) / 100
 
     async def get_markets(self, series_ticker: str = None, status: str = "open") -> list:
         path = "/markets"
