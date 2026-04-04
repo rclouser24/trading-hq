@@ -45,7 +45,9 @@ def sign_kalshi_request(method: str, path: str, timestamp_ms: int) -> str:
 
 def kalshi_headers(method: str, path: str) -> dict:
     ts = int(time.time() * 1000)
-    sig = sign_kalshi_request(method, path, ts)
+    # Kalshi requires the full path including /trade-api/v2 prefix in the signature
+    full_path = f"/trade-api/v2{path}"
+    sig = sign_kalshi_request(method, full_path, ts)
     return {
         "Content-Type": "application/json",
         "KALSHI-ACCESS-KEY": KALSHI_KEY_ID,
