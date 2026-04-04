@@ -72,12 +72,25 @@ class KalshiArbClient:
             return r.json().get("orderbook", {})
 
     async def get_btc_markets(self) -> list:
+        # Try known BTC series tickers first
+        for series in ["KXBTCD", "KXBTC", "BTCD"]:
+            path = "/markets"
+            async with httpx.AsyncClient() as c:
+                r = await c.get(f"{self.base}{path}", headers=kalshi_headers("GET", path),
+                                params={"status": "open", "series_ticker": series, "limit": 50}, timeout=10)
+                markets = r.json().get("markets", [])
+                if markets:
+                    return markets
+
+        # Fallback: scan all and filter
         path = "/markets"
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{self.base}{path}", headers=kalshi_headers("GET", path),
-                            params={"status": "open", "limit": 50}, timeout=10)
+                            params={"status": "open", "limit": 100}, timeout=10)
             markets = r.json().get("markets", [])
-            return [m for m in markets if "btc" in m.get("ticker", "").lower()
+            return [m for m in markets if
+                    "btc" in m.get("ticker", "").lower()
+                    or "btc" in m.get("title", "").lower()
                     or "bitcoin" in m.get("title", "").lower()]
 
     async def place_order(self, ticker: str, side: str, count: int) -> dict:

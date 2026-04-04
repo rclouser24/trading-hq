@@ -58,11 +58,13 @@ class KalshiClient:
     def __init__(self):
         self.base = KALSHI_API_URL
 
-    async def get_balance(self) -> dict:
+    async def get_balance(self) -> float:
         path = "/portfolio/balance"
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{self.base}{path}", headers=kalshi_headers("GET", path), timeout=10)
-            return r.json()
+            data = r.json()
+            # Kalshi returns balance in cents
+            return data.get("balance", 0) / 100
 
     async def get_markets(self, series_ticker: str = None, status: str = "open") -> list:
         path = "/markets"
@@ -155,10 +157,23 @@ async def get_btc_momentum(lookback_minutes: int = 15) -> dict:
 async def find_btc_contracts(client: KalshiClient) -> list:
     """Find active BTC up/down contracts on Kalshi."""
     try:
-        # Search for BTC-related markets
+        # Try series-specific search first (KXBTCD = BTC daily contracts)
+        for series in ["KXBTCD", "KXBTC", "BTCD"]:
+            markets = await client.get_markets(series_ticker=series)
+            if markets:
+                print(f"  Found {len(markets)} contracts via series {series}")
+                return markets
+
+        # Fallback: scan all open markets and filter for BTC
         markets = await client.get_markets()
-        btc_markets = [m for m in markets if "btc" in m.get("ticker", "").lower()
-                       or "bitcoin" in m.get("title", "").lower()]
+        print(f"  Scanning {len(markets)} open markets for BTC...")
+        btc_markets = [
+            m for m in markets
+            if "btc" in m.get("ticker", "").lower()
+            or "btc" in m.get("title", "").lower()
+            or "bitcoin" in m.get("title", "").lower()
+        ]
+        print(f"  Found {len(btc_markets)} BTC contracts")
         return btc_markets
     except Exception as e:
         print(f"  Error fetching markets: {e}")
@@ -234,8 +249,7 @@ async def main():
 
     # Verify connection
     try:
-        balance_data = await client.get_balance()
-        balance = balance_data.get("balance", 0) / 100  # Kalshi returns cents
+        balance = await client.get_balance()
         print(f"   Balance: ${balance:,.2f}")
     except Exception as e:
         print(f"   Auth error: {e}")
@@ -268,8 +282,7 @@ async def main():
 
             # Only trade if confidence is above threshold
             if momentum["confidence"] >= 0.55 and momentum["direction"] != "NEUTRAL":
-                balance_data = await client.get_balance()
-                balance = balance_data.get("balance", 0) / 100
+                balance = await client.get_balance()
                 await execute_trade(client, risk, momentum, balance)
             else:
                 print(f"  Below confidence threshold — waiting")
