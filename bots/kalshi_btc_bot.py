@@ -30,6 +30,10 @@ KALSHI_API_URL = "https://api.elections.kalshi.com/trade-api/v2"
 def sign_kalshi_request(method: str, path: str, timestamp_ms: int) -> str:
     """Sign a Kalshi API request with RSA private key."""
     message = f"{timestamp_ms}{method}{path}"
+    print(f"   [DEBUG] Signing message: '{message[:80]}...'")
+    print(f"   [DEBUG] KEY_ID (first 12): '{KALSHI_KEY_ID[:12]}' len={len(KALSHI_KEY_ID)}")
+    pem_lines = KALSHI_PRIVATE_KEY.strip().splitlines()
+    print(f"   [DEBUG] PEM header: '{pem_lines[0]}', lines={len(pem_lines)}")
     private_key = serialization.load_pem_private_key(
         KALSHI_PRIVATE_KEY.encode(), password=None
     )
