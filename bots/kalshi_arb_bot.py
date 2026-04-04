@@ -39,7 +39,14 @@ def sign_kalshi_request(method: str, path: str, timestamp_ms: int) -> str:
     private_key = serialization.load_pem_private_key(
         KALSHI_PRIVATE_KEY.encode(), password=None
     )
-    signature = private_key.sign(message.encode(), padding.PKCS1v15(), hashes.SHA256())
+    signature = private_key.sign(
+        message.encode('utf-8'),
+        padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()),
+            salt_length=padding.PSS.DIGEST_LENGTH,
+        ),
+        hashes.SHA256(),
+    )
     return base64.b64encode(signature).decode()
 
 
