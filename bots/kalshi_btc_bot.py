@@ -63,6 +63,7 @@ class KalshiClient:
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{self.base}{path}", headers=kalshi_headers("GET", path), timeout=10)
             data = r.json()
+            print(f"   [DEBUG] Balance API response: {data}")
             # Kalshi returns balance in cents
             return data.get("balance", 0) / 100
 
