@@ -279,6 +279,10 @@ async def main():
             continue
 
         try:
+            # Get current balance and persist to dashboard
+            balance = await client.get_balance()
+            update_bot_state(BOT_ID, metadata={"portfolio_balance": round(balance, 2)})
+
             # Get BTC momentum
             momentum = await get_btc_momentum(lookback_minutes=15)
             btc_price = momentum.get("current_price", 0)
@@ -288,7 +292,6 @@ async def main():
 
             # Only trade if confidence is above threshold
             if momentum["confidence"] >= 0.55 and momentum["direction"] != "NEUTRAL":
-                balance = await client.get_balance()
                 await execute_trade(client, risk, momentum, balance)
             else:
                 print(f"  Below confidence threshold — waiting")

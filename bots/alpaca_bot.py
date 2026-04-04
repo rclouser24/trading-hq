@@ -422,6 +422,9 @@ async def main():
         if market_open:
             print(f"\n[{now.strftime('%H:%M:%S')}] Market open — running scan cycle...")
             try:
+                account = await client.get_account()
+                portfolio_value = float(account.get("portfolio_value", 0))
+                update_bot_state(BOT_ID, metadata={"portfolio_balance": round(portfolio_value, 2)})
                 await run_scan_cycle(client, risk)
                 await manage_positions(client)
             except Exception as e:

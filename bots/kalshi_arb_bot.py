@@ -264,6 +264,10 @@ async def main():
             continue
 
         try:
+            # Get current balance and persist to dashboard
+            balance = await client.get_balance()
+            update_bot_state(BOT_ID, metadata={"portfolio_balance": round(balance, 2)})
+
             # 1. Get current Binance price
             t_start = time.time()
             btc_price = await feed.get_price()
