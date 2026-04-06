@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.shared import (
     ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL,
     supabase, log_trade, update_trade, log_equity, log_signal,
-    get_bot_state, update_bot_state, send_alert,
+    get_bot_state, update_bot_state, update_pnl, send_alert,
     RiskManager, query_perplexity, ask_claude,
 )
 
@@ -184,12 +184,14 @@ def analyze_technicals(bars: list) -> dict:
     }
 
     score = sum(signals.values()) / len(signals)
-    all_pass = all(signals.values())
+    # Require 4 of 5 signals (volume surge is a bonus, not a requirement)
+    required = ["price_above_ema20", "ema20_above_ema50", "rsi_in_range", "macd_positive"]
+    required_pass = all(signals[k] for k in required)
 
     return {
         "score": score,
         "signals": signals,
-        "pass": all_pass,
+        "pass": required_pass,
         "rsi": round(rsi, 2),
         "macd": macd,
         "ema20": round(ema20_val, 2),
@@ -242,20 +244,15 @@ async def run_scan_cycle(client: AlpacaClient, risk: RiskManager):
         print(f"[{BOT_ID}] Risk limit: {risk_check['reason']}")
         return
 
-    # Market regime
+    # Market regime — informational only, does not block trades
     regime = await check_market_regime(client)
     log_signal("SPY", "REGIME", "BULLISH" if regime["pass"] else "BEARISH",
                1.0 if regime["pass"] else 0.0, regime)
-
-    if not regime["pass"]:
-        print(f"[{BOT_ID}] Market regime BEARISH — skipping entries. SPY: {regime.get('spy_price')}")
-        if state.get("mode") != "DEFENSIVE":
-            update_bot_state(BOT_ID, mode="DEFENSIVE")
-            send_alert(BOT_ID, "REGIME_SHIFT", "Market regime turned bearish. Switching to DEFENSIVE mode.")
-        return
-    elif state.get("mode") == "DEFENSIVE":
+    if regime["pass"] and state.get("mode") == "DEFENSIVE":
         update_bot_state(BOT_ID, mode="AGGRESSIVE")
-        send_alert(BOT_ID, "REGIME_SHIFT", "Market regime bullish again. Back to AGGRESSIVE.")
+    elif not regime["pass"] and state.get("mode") == "AGGRESSIVE":
+        update_bot_state(BOT_ID, mode="CAUTIOUS")
+    print(f"[{BOT_ID}] Regime: {'BULLISH' if regime['pass'] else 'BEARISH'} | SPY: {regime.get('spy_price')}")
 
     # Get current positions
     positions = await client.get_positions()
@@ -424,7 +421,7 @@ async def main():
             try:
                 account = await client.get_account()
                 portfolio_value = float(account.get("portfolio_value", 0))
-                update_bot_state(BOT_ID, metadata={"portfolio_balance": round(portfolio_value, 2)})
+                update_pnl(BOT_ID, portfolio_value)
                 await run_scan_cycle(client, risk)
                 await manage_positions(client)
             except Exception as e:

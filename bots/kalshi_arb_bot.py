@@ -19,7 +19,7 @@ import httpx
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.shared import (
     KALSHI_KEY_ID, KALSHI_PRIVATE_KEY,
-    supabase, log_trade, log_arb_metric, get_bot_state, update_bot_state,
+    supabase, log_trade, log_arb_metric, get_bot_state, update_bot_state, update_pnl,
     send_alert, RiskManager,
 )
 
@@ -268,9 +268,9 @@ async def main():
             continue
 
         try:
-            # Get current balance and persist to dashboard
+            # Get current balance and update P&L metrics
             balance = await client.get_balance()
-            update_bot_state(BOT_ID, metadata={"portfolio_balance": round(balance, 2)})
+            update_pnl(BOT_ID, balance)
 
             # 1. Get current Binance price
             t_start = time.time()

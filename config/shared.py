@@ -86,6 +86,53 @@ def update_bot_state(bot_id: str, **kwargs):
     supabase.table("bot_state").update(kwargs).eq("id", bot_id).execute()
 
 
+def update_pnl(bot_id: str, current_balance: float):
+    """Update daily/weekly/monthly P&L percentages and high water mark in bot_state.
+    Stores baseline balances in metadata so percentages are computed correctly."""
+    now = datetime.now(timezone.utc)
+    state = get_bot_state(bot_id)
+    meta = state.get("metadata") or {}
+
+    day_key = now.strftime("%Y-%m-%d")
+    week_key = f"{now.year}-W{now.isocalendar()[1]:02d}"
+    month_key = now.strftime("%Y-%m")
+
+    # Seed baselines on first run of each period
+    if meta.get("day_key") != day_key:
+        meta["day_start"] = current_balance
+        meta["day_key"] = day_key
+    if meta.get("week_key") != week_key:
+        meta["week_start"] = current_balance
+        meta["week_key"] = week_key
+    if meta.get("month_key") != month_key:
+        meta["month_start"] = current_balance
+        meta["month_key"] = month_key
+
+    day_start = meta.get("day_start") or current_balance
+    week_start = meta.get("week_start") or current_balance
+    month_start = meta.get("month_start") or current_balance
+
+    daily_pnl = ((current_balance - day_start) / day_start * 100) if day_start else 0
+    weekly_pnl = ((current_balance - week_start) / week_start * 100) if week_start else 0
+    monthly_pnl = ((current_balance - month_start) / month_start * 100) if month_start else 0
+
+    hwm = state.get("high_water_mark") or 0
+    new_hwm = max(hwm, current_balance)
+    drawdown = ((current_balance - new_hwm) / new_hwm * 100) if new_hwm else 0
+
+    meta["portfolio_balance"] = round(current_balance, 2)
+
+    update_bot_state(
+        bot_id,
+        daily_pnl=round(daily_pnl, 4),
+        weekly_pnl=round(weekly_pnl, 4),
+        monthly_pnl=round(monthly_pnl, 4),
+        high_water_mark=round(new_hwm, 2),
+        current_drawdown_pct=round(drawdown, 4),
+        metadata=meta,
+    )
+
+
 def log_research(query: str, summary: str, sentiment: str, sentiment_score: float,
                  confidence: float = 0, catalysts: list = None, risks: list = None,
                  relevant_bots: list = None, raw_response: dict = None):

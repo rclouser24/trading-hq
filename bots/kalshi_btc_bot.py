@@ -18,7 +18,7 @@ import httpx
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.shared import (
     KALSHI_KEY_ID, KALSHI_PRIVATE_KEY,
-    supabase, log_trade, log_equity, get_bot_state, update_bot_state,
+    supabase, log_trade, log_equity, get_bot_state, update_bot_state, update_pnl,
     send_alert, RiskManager, query_perplexity,
 )
 
@@ -224,7 +224,14 @@ async def execute_trade(client: KalshiClient, risk: RiskManager,
             count=contracts_count,
         )
 
-        cost = contracts_count * 0.50  # Approximate avg cost
+        # Check if order actually succeeded
+        if order.get("error") or not order.get("order"):
+            print(f"  ❌ Order rejected: {order}")
+            return
+
+        order_status = order.get("order", {}).get("status", "unknown")
+        filled = order_status in ("filled", "resting", "pending")
+
         log_trade(
             bot_id=BOT_ID,
             ticker=ticker,
@@ -232,7 +239,7 @@ async def execute_trade(client: KalshiClient, risk: RiskManager,
             quantity=contracts_count,
             entry_price=0.50,
             strategy="BTC Directional",
-            status="FILLED",
+            status="FILLED" if filled else order_status.upper(),
             order_type="MARKET",
             sentiment_score=momentum["confidence"],
             reasoning=f"BTC {momentum['direction']} momentum: {momentum['change_pct']:+.4f}% over 15m, confidence {momentum['confidence']:.2f}",
@@ -241,7 +248,7 @@ async def execute_trade(client: KalshiClient, risk: RiskManager,
 
         print(f"  ✅ {side.upper()} {contracts_count}x {ticker} "
               f"(BTC {momentum['direction']} {momentum['change_pct']:+.4f}%, "
-              f"conf: {momentum['confidence']:.2f})")
+              f"conf: {momentum['confidence']:.2f}) — order status: {order_status}")
 
     except Exception as e:
         print(f"  Order error: {e}")
@@ -281,9 +288,9 @@ async def main():
             continue
 
         try:
-            # Get current balance and persist to dashboard
+            # Get current balance and update P&L metrics
             balance = await client.get_balance()
-            update_bot_state(BOT_ID, metadata={"portfolio_balance": round(balance, 2)})
+            update_pnl(BOT_ID, balance)
 
             # Get BTC momentum
             momentum = await get_btc_momentum(lookback_minutes=15)
