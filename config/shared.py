@@ -217,10 +217,8 @@ class RiskManager:
         monthly = state.get("monthly_pnl", 0)
         hwm = state.get("high_water_mark", 0)
 
-        if hwm > 0:
-            drawdown = ((daily - hwm) / hwm) * 100 if hwm else 0
-        else:
-            drawdown = 0
+        # drawdown is already tracked as current_drawdown_pct by update_pnl
+        drawdown = state.get("current_drawdown_pct", 0)
 
         # Monthly kill switch
         if monthly <= self.monthly_kill:

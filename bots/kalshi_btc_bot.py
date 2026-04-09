@@ -24,6 +24,8 @@ from config.shared import (
 
 BOT_ID = "kalshi_btc"
 KALSHI_API_URL = "https://api.elections.kalshi.com/trade-api/v2"
+TRADE_COOLDOWN_S = 300  # Don't trade more than once per 5 minutes
+_last_trade_time = 0
 
 
 # ─── KALSHI AUTH ──────────────────────────────────────────────────
@@ -190,8 +192,15 @@ async def find_btc_contracts(client: KalshiClient) -> list:
 async def execute_trade(client: KalshiClient, risk: RiskManager,
                         momentum: dict, balance: float):
     """Execute a single BTC directional trade."""
+    global _last_trade_time
     if momentum["direction"] == "NEUTRAL":
         print(f"  Momentum neutral ({momentum['change_pct']:+.4f}%) — skipping")
+        return
+
+    # Cooldown: don't spam orders
+    elapsed = time.time() - _last_trade_time
+    if elapsed < TRADE_COOLDOWN_S:
+        print(f"  Cooldown active — {int(TRADE_COOLDOWN_S - elapsed)}s remaining")
         return
 
     # Find suitable contract
@@ -200,13 +209,20 @@ async def execute_trade(client: KalshiClient, risk: RiskManager,
         print("  No BTC contracts available")
         return
 
-    contract = contracts[0]  # Take the nearest expiry
+    # Sort by expiry — nearest first (soonest to resolve = most price sensitivity)
+    contracts.sort(key=lambda m: m.get("close_time") or m.get("expiration_time") or "")
+    contract = contracts[0]
     ticker = contract.get("ticker", "")
+    title = contract.get("title", "").lower()
 
-    # Determine side
-    side = "yes" if momentum["direction"] == "UP" else "no"
+    # Determine contract direction from title, then pick side accordingly
+    contract_asks_up = any(w in title for w in ["above", "higher", "over", "exceed"])
+    if momentum["direction"] == "UP":
+        side = "yes" if contract_asks_up else "no"
+    else:
+        side = "no" if contract_asks_up else "yes"
 
-    # Position size based on confidence
+    # Position size based on confidence — cap at 3 contracts max with $10 balance
     position_dollars = risk.calculate_position_size(
         balance,
         conviction=momentum["confidence"],
@@ -214,8 +230,7 @@ async def execute_trade(client: KalshiClient, risk: RiskManager,
         avg_win=0.80,
         avg_loss=1.0,
     )
-    # Kalshi contracts are typically $1 each, price in cents
-    contracts_count = max(1, int(position_dollars / 1))
+    contracts_count = max(1, min(3, int(position_dollars)))
 
     try:
         order = await client.place_order(
@@ -232,6 +247,7 @@ async def execute_trade(client: KalshiClient, risk: RiskManager,
 
         order_status = order.get("order", {}).get("status", "unknown")
         filled = order_status in ("filled", "resting", "pending")
+        _last_trade_time = time.time()
 
         log_trade(
             bot_id=BOT_ID,

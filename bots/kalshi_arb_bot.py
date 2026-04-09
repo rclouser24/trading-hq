@@ -207,13 +207,15 @@ class ArbDetector:
 
         if binance_says_up == contract_asks_up:
             # Binance agrees with contract direction → buy YES
+            # Edge = how much we think YES is underpriced
             edge = (true_prob - kalshi_implied_prob) * 100
             side = "yes"
         else:
-            # Binance disagrees → buy NO
-            edge = ((1 - true_prob) - (1 - kalshi_implied_prob)) * 100
-            # Actually: edge on NO = (true_no_prob - kalshi_no_price) * 100
-            edge = (true_prob - kalshi_implied_prob) * 100  # Simplified
+            # Binance disagrees with contract direction → buy NO
+            # NO implied prob = 1 - yes_ask_price; edge = how much NO is underpriced
+            no_implied_prob = 1 - kalshi_implied_prob
+            true_no_prob = 1 - true_prob
+            edge = (true_no_prob - no_implied_prob) * 100
             side = "no"
 
         tradeable = (edge >= self.edge_threshold and
@@ -294,10 +296,15 @@ async def main():
                 ticker = contract.get("ticker", "")
                 title = contract.get("title", "")
 
-                # Get Kalshi implied probability (YES price)
+                # Get Kalshi implied probability from orderbook best ask (what we'd pay)
                 try:
                     orderbook = await client.get_orderbook(ticker)
-                    yes_price = contract.get("yes_bid", 50) / 100  # Convert cents to 0-1
+                    # yes_ask is what we pay to buy YES; yes_bid is what we receive selling YES
+                    asks = orderbook.get("yes", [])
+                    yes_ask_cents = asks[0][0] if asks else contract.get("yes_ask", contract.get("yes_bid", 50))
+                    yes_price = yes_ask_cents / 100  # Convert cents to 0-1
+                    if yes_price <= 0 or yes_price >= 1:
+                        continue  # invalid price, skip
                 except Exception:
                     continue
 
@@ -334,6 +341,12 @@ async def main():
                 detector.last_trade_time = time.time()
                 trade_count += 1
 
+                print(f"  [ORDER RESPONSE] {order}")
+                if order.get("error") or not order.get("order"):
+                    print(f"  ❌ Order rejected: {order}")
+                    break
+                order_status = order.get("order", {}).get("status", "unknown")
+
                 log_trade(
                     bot_id=BOT_ID,
                     ticker=ticker,
@@ -341,7 +354,7 @@ async def main():
                     quantity=contracts_count,
                     entry_price=yes_price,
                     strategy="Latency Arb",
-                    status="FILLED",
+                    status="FILLED" if order_status in ("filled", "resting", "pending") else order_status.upper(),
                     order_type="MARKET",
                     edge_pct=arb["edge"],
                     latency_ms=exec_latency,
