@@ -224,6 +224,7 @@ async def execute_trade(client: KalshiClient, risk: RiskManager,
             count=contracts_count,
         )
 
+        print(f"  [ORDER RESPONSE] {order}")
         # Check if order actually succeeded
         if order.get("error") or not order.get("order"):
             print(f"  ❌ Order rejected: {order}")
@@ -261,15 +262,22 @@ async def main():
     client = KalshiClient()
     risk = RiskManager(BOT_ID, daily_limit_pct=-20.0, weekly_limit_pct=-30.0, monthly_kill_pct=-40.0)
 
-    # Verify connection
+    # Verify connection and write initial balance to dashboard
     try:
         balance = await client.get_balance()
         print(f"   Balance: ${balance:,.2f}")
+        update_pnl(BOT_ID, balance)
     except Exception as e:
         import traceback
         print(f"   Auth error: {e}")
         print(f"   Traceback: {traceback.format_exc()}")
         balance = 0
+
+    # Ensure bot is active on startup
+    state = get_bot_state(BOT_ID)
+    if not state.get("active"):
+        print(f"   Bot was paused — resuming automatically on startup")
+        update_bot_state(BOT_ID, active=True, mode="AGGRESSIVE")
 
     while True:
         state = get_bot_state(BOT_ID)

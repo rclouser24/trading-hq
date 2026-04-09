@@ -241,13 +241,20 @@ async def main():
     detector = ArbDetector()
     risk = RiskManager(BOT_ID, daily_limit_pct=-20.0, weekly_limit_pct=-30.0, monthly_kill_pct=-40.0)
 
-    # Verify connection
+    # Verify connection and write initial balance to dashboard
     try:
         balance = await client.get_balance()
         print(f"   Kalshi balance: ${balance:,.2f}")
+        update_pnl(BOT_ID, balance)
     except Exception as e:
         print(f"   Kalshi auth error: {e}")
         balance = 0
+
+    # Ensure bot is active on startup
+    state = get_bot_state(BOT_ID)
+    if not state.get("active"):
+        print(f"   Bot was paused — resuming automatically on startup")
+        update_bot_state(BOT_ID, active=True, mode="AGGRESSIVE")
 
     trade_count = 0
     win_count = 0
