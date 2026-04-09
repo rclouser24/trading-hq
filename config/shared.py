@@ -261,6 +261,117 @@ class RiskManager:
         return portfolio_value * size_pct
 
 
+# ─── ADAPTIVE LEARNING ───────────────────────────────────────────
+class AdaptiveParams:
+    """Learns from settled trade outcomes and adjusts bot parameters over time."""
+
+    DEFAULTS = {
+        "kalshi_btc": {
+            "confidence_threshold": 0.55,
+            "lookback_minutes": 15,
+            "min_change_pct": 0.05,
+        },
+        "kalshi_arb": {
+            "edge_threshold": 3.0,
+            "min_trade_interval": 10,
+        },
+    }
+    MIN_TRADES_TO_TUNE = 5   # Need at least this many settled trades before tuning
+    TUNE_EVERY_N = 10        # Re-tune after every N settled trades
+
+    def __init__(self, bot_id: str):
+        self.bot_id = bot_id
+        self.defaults = self.DEFAULTS.get(bot_id, {})
+
+    def load(self) -> dict:
+        """Load current learned params from bot_state metadata."""
+        state = get_bot_state(self.bot_id)
+        meta = state.get("metadata") or {}
+        learned = meta.get("learned_params") or {}
+        return {**self.defaults, **learned}
+
+    def save(self, params: dict):
+        """Persist learned params into bot_state metadata."""
+        state = get_bot_state(self.bot_id)
+        meta = dict(state.get("metadata") or {})
+        meta["learned_params"] = params
+        update_bot_state(self.bot_id, metadata=meta)
+
+    def get_recent_stats(self, n: int = 20) -> dict:
+        """Compute win/loss stats from last N settled trades."""
+        res = supabase.table("trades").select("*") \
+            .eq("bot_id", self.bot_id) \
+            .in_("status", ["WON", "LOST"]) \
+            .order("opened_at", desc=True) \
+            .limit(n).execute()
+        trades = res.data or []
+        if not trades:
+            return {"total": 0, "wins": 0, "losses": 0, "win_rate": 0.5, "avg_pnl": 0}
+
+        wins = sum(1 for t in trades if t["status"] == "WON")
+        pnls = [t.get("pnl") or 0 for t in trades]
+        return {
+            "total": len(trades),
+            "wins": wins,
+            "losses": len(trades) - wins,
+            "win_rate": wins / len(trades),
+            "avg_pnl": sum(pnls) / len(pnls),
+        }
+
+    def tune(self) -> dict:
+        """Adjust params based on recent performance. Returns updated params dict."""
+        stats = self.get_recent_stats()
+        params = self.load()
+
+        if stats["total"] < self.MIN_TRADES_TO_TUNE:
+            return params
+
+        # Only re-tune at multiples of TUNE_EVERY_N
+        if stats["total"] % self.TUNE_EVERY_N != 0:
+            return params
+
+        win_rate = stats["win_rate"]
+        changes = []
+
+        if self.bot_id == "kalshi_btc":
+            old = params["confidence_threshold"]
+            if win_rate >= 0.65:
+                # Winning well — relax threshold slightly to catch more trades
+                params["confidence_threshold"] = round(max(0.50, old - 0.02), 2)
+            elif win_rate <= 0.40:
+                # Losing — raise bar to be more selective
+                params["confidence_threshold"] = round(min(0.80, old + 0.02), 2)
+            if params["confidence_threshold"] != old:
+                changes.append(f"confidence_threshold {old:.2f}→{params['confidence_threshold']:.2f}")
+
+            old_lb = params["lookback_minutes"]
+            # If avg P&L is negative, try a shorter lookback (faster signals)
+            if stats["avg_pnl"] < -0.05 and old_lb > 5:
+                params["lookback_minutes"] = max(5, old_lb - 5)
+                changes.append(f"lookback_minutes {old_lb}→{params['lookback_minutes']}")
+            elif stats["avg_pnl"] > 0.05 and old_lb < 30:
+                params["lookback_minutes"] = min(30, old_lb + 5)
+                changes.append(f"lookback_minutes {old_lb}→{params['lookback_minutes']}")
+
+        elif self.bot_id == "kalshi_arb":
+            old = params["edge_threshold"]
+            if win_rate >= 0.65:
+                params["edge_threshold"] = round(max(1.0, old - 0.5), 1)
+            elif win_rate <= 0.40:
+                params["edge_threshold"] = round(min(8.0, old + 0.5), 1)
+            if params["edge_threshold"] != old:
+                changes.append(f"edge_threshold {old:.1f}→{params['edge_threshold']:.1f}%")
+
+        if changes:
+            self.save(params)
+            print(f"  🧠 LEARNED [{self.bot_id}]: {', '.join(changes)} "
+                  f"| win_rate={win_rate:.0%} over {stats['total']} trades")
+        else:
+            print(f"  🧠 TUNE CHECK: win_rate={win_rate:.0%} over {stats['total']} trades — no change needed")
+
+        return params
+
+
 # ─── PERPLEXITY RESEARCH ─────────────────────────────────────────
 async def query_perplexity(query: str) -> dict:
     """Query Perplexity API for real-time research."""

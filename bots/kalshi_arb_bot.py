@@ -19,8 +19,8 @@ import httpx
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.shared import (
     KALSHI_KEY_ID, KALSHI_PRIVATE_KEY,
-    supabase, log_trade, log_arb_metric, get_bot_state, update_bot_state, update_pnl,
-    send_alert, RiskManager,
+    supabase, log_trade, update_trade, log_arb_metric, get_bot_state, update_bot_state,
+    update_pnl, send_alert, RiskManager, AdaptiveParams,
 )
 
 BOT_ID = "kalshi_arb"
@@ -105,6 +105,13 @@ class KalshiArbClient:
                     "btc" in m.get("ticker", "").lower()
                     or "btc" in m.get("title", "").lower()
                     or "bitcoin" in m.get("title", "").lower()]
+
+    async def get_orders(self, status: str = "settled", limit: int = 50) -> list:
+        path = "/portfolio/orders"
+        async with httpx.AsyncClient() as c:
+            r = await c.get(f"{self.base}{path}", headers=kalshi_headers("GET", path),
+                            params={"status": status, "limit": limit}, timeout=10)
+            return r.json().get("orders", [])
 
     async def place_order(self, ticker: str, side: str, count: int) -> dict:
         path = "/portfolio/orders"
@@ -231,6 +238,53 @@ class ArbDetector:
         }
 
 
+# ─── TRADE SETTLEMENT ────────────────────────────────────────────
+async def settle_trades(client: KalshiArbClient, adaptive: AdaptiveParams):
+    """Check Kalshi for settled orders, update DB trade records, retune params."""
+    try:
+        settled_orders = await client.get_orders(status="settled", limit=50)
+        if not settled_orders:
+            return
+
+        res = supabase.table("trades").select("*") \
+            .eq("bot_id", BOT_ID).eq("status", "FILLED").execute()
+        open_trades = res.data or []
+        if not open_trades:
+            return
+
+        by_order_id = {}
+        for t in open_trades:
+            oid = (t.get("metadata") or {}).get("order_id")
+            if oid:
+                by_order_id[oid] = t
+
+        for order in settled_orders:
+            order_id = order.get("order_id") or order.get("id")
+            trade = by_order_id.get(order_id)
+            if not trade:
+                continue
+
+            payout_cents = order.get("payout", 0)
+            qty = trade.get("quantity") or 1
+            entry = trade.get("entry_price") or 0.50
+            pnl = round((payout_cents / 100) - (qty * entry), 4)
+            won = payout_cents > 0
+
+            update_trade(
+                trade["id"],
+                status="WON" if won else "LOST",
+                exit_price=round(payout_cents / 100 / qty, 4),
+                pnl=pnl,
+                closed_at=datetime.now(timezone.utc).isoformat(),
+            )
+            print(f"  📊 Settled: {trade['ticker']} {'✅ WON' if won else '❌ LOST'} | P&L: ${pnl:+.4f}")
+
+        adaptive.tune()
+
+    except Exception as e:
+        print(f"  Settlement error: {e}")
+
+
 # ─── MAIN ARB LOOP ───────────────────────────────────────────────
 async def main():
     print(f"🚀 Kalshi Latency Arb Bot starting...")
@@ -240,8 +294,11 @@ async def main():
 
     client = KalshiArbClient()
     feed = BinanceFeed()
-    detector = ArbDetector()
+    adaptive = AdaptiveParams(BOT_ID)
+    params = adaptive.load()
+    detector = ArbDetector(edge_threshold=params["edge_threshold"])
     risk = RiskManager(BOT_ID, daily_limit_pct=-20.0, weekly_limit_pct=-30.0, monthly_kill_pct=-40.0)
+    print(f"   Loaded params: {params}")
 
     # Verify connection and write initial balance to dashboard
     try:
@@ -280,6 +337,13 @@ async def main():
             # Get current balance and update P&L metrics
             balance = await client.get_balance()
             update_pnl(BOT_ID, balance)
+
+            # Check settled trades and retune — update detector threshold if changed
+            await settle_trades(client, adaptive)
+            new_params = adaptive.load()
+            if new_params["edge_threshold"] != detector.edge_threshold:
+                print(f"  🧠 Updating edge threshold: {detector.edge_threshold}→{new_params['edge_threshold']}%")
+                detector.edge_threshold = new_params["edge_threshold"]
 
             # 1. Get current Binance price
             t_start = time.time()
@@ -346,6 +410,7 @@ async def main():
                     print(f"  ❌ Order rejected: {order}")
                     break
                 order_status = order.get("order", {}).get("status", "unknown")
+                order_id = order.get("order", {}).get("order_id") or order.get("order", {}).get("id")
 
                 log_trade(
                     bot_id=BOT_ID,
@@ -360,7 +425,7 @@ async def main():
                     latency_ms=exec_latency,
                     reasoning=f"Edge {arb['edge']:.1f}% | BTC {move['direction']} {move['change_pct']:+.4f}% | "
                               f"Kalshi implied {yes_price:.2f} vs true {arb['true_prob']:.2f}",
-                    metadata={"arb": arb, "move": move, "binance_latency_ms": binance_latency},
+                    metadata={"arb": arb, "move": move, "binance_latency_ms": binance_latency, "order_id": order_id},
                 )
 
                 print(f"  ⚡ ARB TRADE #{trade_count}: {arb['side'].upper()} {contracts_count}x {ticker} "

@@ -18,8 +18,8 @@ import httpx
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.shared import (
     KALSHI_KEY_ID, KALSHI_PRIVATE_KEY,
-    supabase, log_trade, log_equity, get_bot_state, update_bot_state, update_pnl,
-    send_alert, RiskManager, query_perplexity,
+    supabase, log_trade, update_trade, log_equity, get_bot_state, update_bot_state,
+    update_pnl, send_alert, RiskManager, query_perplexity, AdaptiveParams,
 )
 
 BOT_ID = "kalshi_btc"
@@ -120,6 +120,13 @@ class KalshiClient:
             r = await c.get(f"{self.base}{path}", headers=kalshi_headers("GET", path), timeout=10)
             return r.json().get("market_positions", [])
 
+    async def get_orders(self, status: str = "settled", limit: int = 50) -> list:
+        path = "/portfolio/orders"
+        async with httpx.AsyncClient() as c:
+            r = await c.get(f"{self.base}{path}", headers=kalshi_headers("GET", path),
+                            params={"status": status, "limit": limit}, timeout=10)
+            return r.json().get("orders", [])
+
 
 # ─── BTC PRICE FEED ───────────────────────────────────────────────
 async def get_btc_price() -> float:
@@ -160,6 +167,58 @@ async def get_btc_momentum(lookback_minutes: int = 15) -> dict:
             "current_price": closes[-1],
             "start_price": closes[0],
         }
+
+
+# ─── TRADE SETTLEMENT & LEARNING ─────────────────────────────────
+async def settle_trades(client: KalshiClient, adaptive: AdaptiveParams):
+    """Check Kalshi for settled orders, update DB, then retune params."""
+    try:
+        settled_orders = await client.get_orders(status="settled", limit=50)
+        if not settled_orders:
+            return
+
+        # Load our FILLED trades that haven't been closed yet
+        res = supabase.table("trades").select("*") \
+            .eq("bot_id", BOT_ID).eq("status", "FILLED").execute()
+        open_trades = res.data or []
+        if not open_trades:
+            return
+
+        # Index open trades by order_id stored in metadata
+        by_order_id = {}
+        for t in open_trades:
+            oid = (t.get("metadata") or {}).get("order_id")
+            if oid:
+                by_order_id[oid] = t
+
+        for order in settled_orders:
+            order_id = order.get("order_id") or order.get("id")
+            trade = by_order_id.get(order_id)
+            if not trade:
+                continue
+
+            # Kalshi payout is in cents
+            payout_cents = order.get("payout", 0)
+            qty = trade.get("quantity") or 1
+            entry = trade.get("entry_price") or 0.50
+            cost = qty * entry
+            pnl = round((payout_cents / 100) - cost, 4)
+            won = payout_cents > 0
+
+            update_trade(
+                trade["id"],
+                status="WON" if won else "LOST",
+                exit_price=round(payout_cents / 100 / qty, 4),
+                pnl=pnl,
+                closed_at=datetime.now(timezone.utc).isoformat(),
+            )
+            print(f"  📊 Settled: {trade['ticker']} {'✅ WON' if won else '❌ LOST'} | P&L: ${pnl:+.4f}")
+
+        # Retune params based on updated outcomes
+        adaptive.tune()
+
+    except Exception as e:
+        print(f"  Settlement error: {e}")
 
 
 # ─── TRADING LOGIC ────────────────────────────────────────────────
@@ -246,6 +305,7 @@ async def execute_trade(client: KalshiClient, risk: RiskManager,
             return
 
         order_status = order.get("order", {}).get("status", "unknown")
+        order_id = order.get("order", {}).get("order_id") or order.get("order", {}).get("id")
         filled = order_status in ("filled", "resting", "pending")
         _last_trade_time = time.time()
 
@@ -260,7 +320,7 @@ async def execute_trade(client: KalshiClient, risk: RiskManager,
             order_type="MARKET",
             sentiment_score=momentum["confidence"],
             reasoning=f"BTC {momentum['direction']} momentum: {momentum['change_pct']:+.4f}% over 15m, confidence {momentum['confidence']:.2f}",
-            metadata=momentum,
+            metadata={**momentum, "order_id": order_id},
         )
 
         print(f"  ✅ {side.upper()} {contracts_count}x {ticker} "
@@ -277,6 +337,9 @@ async def main():
 
     client = KalshiClient()
     risk = RiskManager(BOT_ID, daily_limit_pct=-20.0, weekly_limit_pct=-30.0, monthly_kill_pct=-40.0)
+    adaptive = AdaptiveParams(BOT_ID)
+    params = adaptive.load()
+    print(f"   Loaded params: {params}")
 
     # Verify connection and write initial balance to dashboard
     try:
@@ -316,15 +379,20 @@ async def main():
             balance = await client.get_balance()
             update_pnl(BOT_ID, balance)
 
-            # Get BTC momentum
-            momentum = await get_btc_momentum(lookback_minutes=15)
+            # Check for settled trades and retune params
+            await settle_trades(client, adaptive)
+            params = adaptive.load()
+
+            # Get BTC momentum using learned lookback
+            momentum = await get_btc_momentum(lookback_minutes=params["lookback_minutes"])
             btc_price = momentum.get("current_price", 0)
             print(f"\n[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] "
                   f"BTC: ${btc_price:,.2f} | {momentum['direction']} "
-                  f"({momentum['change_pct']:+.4f}%) | Conf: {momentum['confidence']:.2f}")
+                  f"({momentum['change_pct']:+.4f}%) | Conf: {momentum['confidence']:.2f} "
+                  f"| Threshold: {params['confidence_threshold']:.2f}")
 
-            # Only trade if confidence is above threshold
-            if momentum["confidence"] >= 0.55 and momentum["direction"] != "NEUTRAL":
+            # Use learned confidence threshold
+            if momentum["confidence"] >= params["confidence_threshold"] and momentum["direction"] != "NEUTRAL":
                 await execute_trade(client, risk, momentum, balance)
             else:
                 print(f"  Below confidence threshold — waiting")
