@@ -46,7 +46,7 @@ class AlpacaClient:
             r = await c.get(
                 f"{self.data_url}/v2/stocks/{ticker}/bars",
                 headers=self.headers,
-                params={"timeframe": timeframe, "limit": limit, "feed": "iex"},
+                params={"timeframe": timeframe, "limit": limit, "feed": "sip"},
                 timeout=10,
             )
             return r.json().get("bars", [])
@@ -278,13 +278,20 @@ async def run_scan_cycle(client: AlpacaClient, risk: RiskManager):
         try:
             # 1. Technical analysis
             bars = await client.get_bars(ticker, limit=60)
+            if not bars:
+                print(f"  [{ticker}] No bar data returned — skipping")
+                continue
             technicals = analyze_technicals(bars)
+            sigs = technicals.get("signals", {})
+            print(f"  [{ticker}] score={technicals['score']:.2f} rsi={technicals.get('rsi')} "
+                  f"p>ema20={sigs.get('price_above_ema20')} ema20>ema50={sigs.get('ema20_above_ema50')} "
+                  f"rsi_ok={sigs.get('rsi_in_range')} macd={sigs.get('macd_positive')}")
             log_signal(ticker, "TECHNICAL",
                        "BULLISH" if technicals["pass"] else "NEUTRAL",
                        technicals["score"], technicals)
 
             if not technicals["pass"]:
-                print(f"  [{ticker}] Technicals FAIL (score: {technicals['score']:.2f})")
+                print(f"  [{ticker}] Technicals FAIL — skipping")
                 continue
 
             # 2. Perplexity sentiment
