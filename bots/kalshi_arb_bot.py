@@ -15,6 +15,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 import httpx
+import websockets
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.shared import (
@@ -85,26 +86,31 @@ class KalshiArbClient:
             return r.json().get("orderbook", {})
 
     async def get_btc_markets(self) -> list:
-        # Try known BTC series tickers first
-        for series in ["KXBTCD", "KXBTC", "BTCD"]:
+        """Return BTC contracts sorted by expiry, preferring 5-minute markets."""
+        now = datetime.now(timezone.utc)
+        # Try 5-minute series first, then fallback to daily
+        for series in ["KXBTC5M", "KXBTC-5M", "KXBTCM5", "BTCM5", "KXBTCD", "KXBTC", "BTCD"]:
             path = "/markets"
             async with httpx.AsyncClient() as c:
                 r = await c.get(f"{self.base}{path}", headers=kalshi_headers("GET", path),
                                 params={"status": "open", "series_ticker": series, "limit": 50}, timeout=10)
                 markets = r.json().get("markets", [])
                 if markets:
+                    markets.sort(key=lambda m: m.get("close_time") or "")
                     return markets
 
-        # Fallback: scan all and filter
+        # Fallback: scan all and filter, prefer short-expiry
         path = "/markets"
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{self.base}{path}", headers=kalshi_headers("GET", path),
                             params={"status": "open", "limit": 100}, timeout=10)
             markets = r.json().get("markets", [])
-            return [m for m in markets if
-                    "btc" in m.get("ticker", "").lower()
-                    or "btc" in m.get("title", "").lower()
-                    or "bitcoin" in m.get("title", "").lower()]
+            btc = [m for m in markets if
+                   "btc" in m.get("ticker", "").lower()
+                   or "btc" in m.get("title", "").lower()
+                   or "bitcoin" in m.get("title", "").lower()]
+            btc.sort(key=lambda m: m.get("close_time") or "")
+            return btc
 
     async def get_orders(self, status: str = "settled", limit: int = 50) -> list:
         path = "/portfolio/orders"
@@ -127,39 +133,56 @@ class KalshiArbClient:
             return r.json()
 
 
-# ─── BINANCE PRICE FEED ──────────────────────────────────────────
+# ─── BINANCE LIVE WEBSOCKET FEED ─────────────────────────────────
+HIGH_ACTIVITY_WINDOWS_UTC = [(0, 2), (8, 10), (13, 16), (20, 22)]
+
+def is_high_activity_hour() -> bool:
+    hour = datetime.now(timezone.utc).hour
+    return any(start <= hour < end for start, end in HIGH_ACTIVITY_WINDOWS_UTC)
+
+
 class BinanceFeed:
-    """High-frequency BTC price monitoring from Binance."""
+    """Live BTC price feed via Binance WebSocket — zero REST polling lag."""
 
     def __init__(self):
-        self.last_price = 0
-        self.last_update = 0
-        self.price_history = []  # (timestamp, price) tuples
+        self.last_price = 0.0
+        self.price_history = []  # (timestamp, price), 5-min window
+        self._task = None
+
+    def start(self):
+        self._task = asyncio.create_task(self._run())
+
+    async def _run(self):
+        uri = "wss://stream.binance.us:9443/ws/btcusdt@aggTrade"
+        while True:
+            try:
+                async with websockets.connect(uri, ping_interval=20) as ws:
+                    print("  📡 Arb Binance WebSocket connected")
+                    async for raw in ws:
+                        data = json.loads(raw)
+                        price = float(data.get("p", 0))
+                        if price > 0:
+                            now = time.time()
+                            self.last_price = price
+                            self.price_history.append((now, price))
+                            cutoff = now - 300  # 5-min window
+                            self.price_history = [(t, p) for t, p in self.price_history if t > cutoff]
+            except Exception as e:
+                print(f"  Arb Binance WS error: {e} — reconnecting in 5s")
+                await asyncio.sleep(5)
 
     async def get_price(self) -> float:
-        """Get current BTC/USDT price from Binance REST API."""
-        async with httpx.AsyncClient() as c:
-            r = await c.get("https://api.binance.us/api/v3/ticker/price",
-                            params={"symbol": "BTCUSDT"}, timeout=3)
-            price = float(r.json()["price"])
-            now = time.time()
-            self.last_price = price
-            self.last_update = now
-            self.price_history.append((now, price))
-            # Keep last 5 minutes of history
-            cutoff = now - 300
-            self.price_history = [(t, p) for t, p in self.price_history if t > cutoff]
-            return price
+        """Return latest live price (no HTTP call needed)."""
+        return self.last_price
 
     def get_recent_move(self, seconds: int = 30) -> dict:
-        """Calculate price move over recent window."""
         if len(self.price_history) < 2:
             return {"direction": "NEUTRAL", "change_pct": 0, "magnitude": 0}
 
         cutoff = time.time() - seconds
         recent = [(t, p) for t, p in self.price_history if t > cutoff]
         if len(recent) < 2:
-            return {"direction": "NEUTRAL", "change_pct": 0, "magnitude": 0}
+            recent = self.price_history[-2:]
 
         start_price = recent[0][1]
         end_price = recent[-1][1]
@@ -294,11 +317,15 @@ async def main():
 
     client = KalshiArbClient()
     feed = BinanceFeed()
+    feed.start()
     adaptive = AdaptiveParams(BOT_ID)
     params = adaptive.load()
     detector = ArbDetector(edge_threshold=params["edge_threshold"])
     risk = RiskManager(BOT_ID, daily_limit_pct=-20.0, weekly_limit_pct=-30.0, monthly_kill_pct=-40.0)
     print(f"   Loaded params: {params}")
+    print(f"   High-activity windows (UTC): {HIGH_ACTIVITY_WINDOWS_UTC}")
+    print("   Waiting 5s for WebSocket to seed price history...")
+    await asyncio.sleep(5)
 
     # Verify connection and write initial balance to dashboard
     try:
@@ -345,7 +372,14 @@ async def main():
                 print(f"  🧠 Updating edge threshold: {detector.edge_threshold}→{new_params['edge_threshold']}%")
                 detector.edge_threshold = new_params["edge_threshold"]
 
-            # 1. Get current Binance price
+            # Time-of-day filter
+            if not is_high_activity_hour():
+                hour = datetime.now(timezone.utc).hour
+                print(f"  ⏰ Outside high-activity window (UTC {hour}h) — skipping")
+                await asyncio.sleep(5)
+                continue
+
+            # 1. Get live price from WebSocket (no HTTP call)
             t_start = time.time()
             btc_price = await feed.get_price()
             binance_latency = (time.time() - t_start) * 1000
