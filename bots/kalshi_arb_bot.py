@@ -32,6 +32,9 @@ EDGE_THRESHOLD_PCT = 3.0       # Minimum edge to trigger a trade
 MAX_POSITION_PCT = 0.08        # 8% of portfolio per trade
 KELLY_FRACTION = 0.25          # Quarter-Kelly for safety
 MIN_LIQUIDITY = 50000          # Minimum contract liquidity
+MAX_DAILY_TRADES = 20          # Hard cap — protect balance from over-trading
+_daily_trade_count = 0
+_daily_trade_date = ""
 
 
 # ─── KALSHI AUTH (same as btc bot) ────────────────────────────────
@@ -281,8 +284,14 @@ async def settle_trades(client: KalshiArbClient, adaptive: AdaptiveParams):
             if oid:
                 by_order_id[oid] = t
 
+        # Debug: verify order_id field name from Kalshi
+        if settled_orders:
+            sample = settled_orders[0]
+            print(f"  [SETTLE DEBUG] keys={list(sample.keys())} order_id={sample.get('order_id')} id={sample.get('id')}")
+
         for order in settled_orders:
-            order_id = order.get("order_id") or order.get("id")
+            order_id = (order.get("order_id") or order.get("id")
+                        or order.get("client_order_id"))
             trade = by_order_id.get(order_id)
             if not trade:
                 continue
@@ -372,6 +381,18 @@ async def main():
                 print(f"  🧠 Updating edge threshold: {detector.edge_threshold}→{new_params['edge_threshold']}%")
                 detector.edge_threshold = new_params["edge_threshold"]
 
+            # Daily trade cap check
+            global _daily_trade_count, _daily_trade_date
+            today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            if _daily_trade_date != today_str:
+                _daily_trade_count = 0
+                _daily_trade_date = today_str
+                print(f"  📅 New day — arb trade count reset")
+            if _daily_trade_count >= MAX_DAILY_TRADES:
+                print(f"  ⚠️ Daily arb cap ({_daily_trade_count}/{MAX_DAILY_TRADES}) — sleeping 5m")
+                await asyncio.sleep(300)
+                continue
+
             # Time-of-day filter
             if not is_high_activity_hour():
                 hour = datetime.now(timezone.utc).hour
@@ -438,6 +459,8 @@ async def main():
 
                 detector.last_trade_time = time.time()
                 trade_count += 1
+                _daily_trade_count += 1
+                print(f"  📊 Daily arb trades: {_daily_trade_count}/{MAX_DAILY_TRADES}")
 
                 print(f"  [ORDER RESPONSE] {order}")
                 if order.get("error") or not order.get("order"):

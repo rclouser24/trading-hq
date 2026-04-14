@@ -32,7 +32,11 @@ KALSHI_API_URL = "https://api.elections.kalshi.com/trade-api/v2"
 TRADE_COOLDOWN_S = 300      # Minimum seconds between new entries
 PROFIT_TARGET   = 0.35      # Exit if contract price moves +35% in our favor
 STOP_LOSS       = 0.30      # Exit if contract price moves -30% against us
+MIN_CHANGE_PCT  = 0.20      # BTC must have moved at least 0.20% to consider entry
+MAX_DAILY_TRADES = 10       # Hard cap — protect $10 balance from over-trading
 _last_trade_time = 0
+_daily_trade_count = 0
+_daily_trade_date = ""
 
 # High-volatility UTC hour windows — only trade during these periods
 # (Asian open, London open, US open, US close)
@@ -217,28 +221,36 @@ class BinanceLiveFeed:
 # ─── ORDER BOOK IMBALANCE SIGNAL ─────────────────────────────────
 async def get_orderbook_signal(client: KalshiClient, ticker: str) -> dict:
     """Compute YES/NO volume imbalance from the order book.
-    Imbalance > 0.6 = market is betting UP strongly.
-    Imbalance < 0.4 = market is betting DOWN strongly."""
+    Kalshi orderbook format:
+      {"yes": [[price_cents, size], ...], "no": [[price_cents, size], ...]}
+    YES levels = bids to buy YES (bullish sentiment)
+    NO levels  = bids to buy NO  (bearish sentiment)
+    Imbalance > 0.6 means strong bullish pressure."""
     try:
         ob = await client.get_orderbook(ticker)
-        # yes = [[price_cents, size], ...] — YES buyers (bullish)
-        # no  = [[price_cents, size], ...] — NO buyers (bearish)
+        print(f"  [OB RAW] keys={list(ob.keys())} yes_count={len(ob.get('yes',[]))} no_count={len(ob.get('no',[]))}")
+
         yes_levels = ob.get("yes", [])
         no_levels  = ob.get("no", [])
 
-        yes_vol = sum(lvl[1] for lvl in yes_levels[:5] if len(lvl) >= 2)
-        no_vol  = sum(lvl[1] for lvl in no_levels[:5]  if len(lvl) >= 2)
+        # Kalshi levels: [[price_cents, size], ...]
+        # YES levels sorted highest bid first; NO levels sorted highest bid first
+        yes_vol = sum(int(lvl[1]) for lvl in yes_levels[:10] if len(lvl) >= 2)
+        no_vol  = sum(int(lvl[1]) for lvl in no_levels[:10]  if len(lvl) >= 2)
         total = yes_vol + no_vol
 
         if total == 0:
-            return {"imbalance": 0.5, "bias": "NEUTRAL", "yes_vol": 0, "no_vol": 0}
+            # Fallback: use market-level yes_bid/no_bid from contract data
+            return {"imbalance": 0.5, "bias": "NEUTRAL", "yes_vol": 0, "no_vol": 0,
+                    "yes_ask_cents": 50, "no_ask_cents": 50}
 
         imbalance = yes_vol / total
         bias = "BULLISH" if imbalance > 0.60 else "BEARISH" if imbalance < 0.40 else "NEUTRAL"
 
-        # Best ask prices for sizing
-        yes_ask_cents = yes_levels[0][0] if yes_levels else 50
-        no_ask_cents  = no_levels[0][0]  if no_levels  else 50
+        # Best ask = lowest price level on the opposite side (what we'd pay to buy)
+        # YES ask = lowest NO bid price mirrored (complementary), or just use yes_levels[-1]
+        yes_ask_cents = yes_levels[-1][0] if yes_levels else 50   # worst (highest) yes bid ≈ ask
+        no_ask_cents  = no_levels[-1][0]  if no_levels  else 50
 
         return {
             "imbalance": round(imbalance, 3),
@@ -250,7 +262,8 @@ async def get_orderbook_signal(client: KalshiClient, ticker: str) -> dict:
         }
     except Exception as e:
         print(f"  Orderbook signal error: {e}")
-        return {"imbalance": 0.5, "bias": "NEUTRAL", "yes_vol": 0, "no_vol": 0}
+        return {"imbalance": 0.5, "bias": "NEUTRAL", "yes_vol": 0, "no_vol": 0,
+                "yes_ask_cents": 50, "no_ask_cents": 50}
 
 
 # ─── 5-MINUTE CONTRACT FINDER ────────────────────────────────────
@@ -400,8 +413,14 @@ async def settle_trades(client: KalshiClient, adaptive: AdaptiveParams):
             if oid:
                 by_order_id[oid] = t
 
+        # Debug: print first settled order keys once to verify field names
+        if settled_orders:
+            sample = settled_orders[0]
+            print(f"  [SETTLE DEBUG] keys={list(sample.keys())} order_id={sample.get('order_id')} id={sample.get('id')}")
+
         for order in settled_orders:
-            order_id = order.get("order_id") or order.get("id")
+            order_id = (order.get("order_id") or order.get("id")
+                        or order.get("client_order_id"))
             trade = by_order_id.get(order_id)
             if not trade:
                 continue
@@ -431,7 +450,17 @@ async def settle_trades(client: KalshiClient, adaptive: AdaptiveParams):
 async def execute_trade(client: KalshiClient, risk: RiskManager,
                          momentum: dict, ob_signal: dict, balance: float):
     """Evaluate all signals and execute a trade with mid-window monitor."""
-    global _last_trade_time
+    global _last_trade_time, _daily_trade_count, _daily_trade_date
+
+    # 0. Daily trade cap
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _daily_trade_date != today:
+        _daily_trade_count = 0
+        _daily_trade_date = today
+        print(f"  📅 New day — trade count reset")
+    if _daily_trade_count >= MAX_DAILY_TRADES:
+        print(f"  ⚠️ Daily cap reached ({_daily_trade_count}/{MAX_DAILY_TRADES}) — resuming tomorrow")
+        return
 
     # 1. Time-of-day filter
     if not is_high_activity_hour():
@@ -503,6 +532,8 @@ async def execute_trade(client: KalshiClient, risk: RiskManager,
         order_id = order.get("order", {}).get("order_id") or order.get("order", {}).get("id")
         filled = order_status in ("filled", "resting", "pending")
         _last_trade_time = time.time()
+        _daily_trade_count += 1
+        print(f"  📊 Daily trades: {_daily_trade_count}/{MAX_DAILY_TRADES}")
 
         trade_data = {
             **momentum,
@@ -618,7 +649,8 @@ async def main():
                   f"| Window: {'✅' if in_window else '⏸'}")
 
             if (momentum["confidence"] >= params["confidence_threshold"]
-                    and momentum["direction"] != "NEUTRAL"):
+                    and momentum["direction"] != "NEUTRAL"
+                    and abs(momentum["change_pct"]) >= MIN_CHANGE_PCT):
                 # Get orderbook signal for the best available contract
                 contracts = await find_5min_btc_contracts(client)
                 if contracts:
@@ -628,8 +660,12 @@ async def main():
                     await execute_trade(client, risk, momentum, ob_signal, balance)
                 else:
                     print("  No contracts found for orderbook check")
+            elif momentum["direction"] == "NEUTRAL":
+                print(f"  Momentum NEUTRAL — waiting")
+            elif abs(momentum["change_pct"]) < MIN_CHANGE_PCT:
+                print(f"  BTC move {momentum['change_pct']:+.4f}% below min {MIN_CHANGE_PCT}% — waiting")
             else:
-                print(f"  Below confidence threshold — waiting")
+                print(f"  Below confidence threshold ({momentum['confidence']:.2f} < {params['confidence_threshold']:.2f}) — waiting")
 
         except Exception as e:
             import traceback
