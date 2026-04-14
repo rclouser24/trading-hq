@@ -89,10 +89,10 @@ class KalshiArbClient:
             return r.json().get("orderbook", {})
 
     async def get_btc_markets(self) -> list:
-        """Return BTC contracts sorted by expiry, preferring 5-minute markets."""
+        """Return BTC contracts sorted by expiry.
+        KXBTC15M = confirmed 15-minute markets; KXBTCD = daily fallback."""
         now = datetime.now(timezone.utc)
-        # Try 5-minute series first, then fallback to daily
-        for series in ["KXBTC5M", "KXBTC-5M", "KXBTCM5", "BTCM5", "KXBTCD", "KXBTC", "BTCD"]:
+        for series in ["KXBTC15M", "KXBTCD", "KXBTC"]:
             path = "/markets"
             async with httpx.AsyncClient() as c:
                 r = await c.get(f"{self.base}{path}", headers=kalshi_headers("GET", path),

@@ -5,7 +5,7 @@ Strategies adopted from Polymarket research:
   2. Binance WebSocket: live price feed with zero polling lag
   3. Order book imbalance: YES/NO volume bias as entry confirmation
   4. Time-of-day filter: only trade during high-volatility windows
-  5. 5-minute markets: target shortest-duration contracts for maximum signal relevance
+  5. 15-minute markets (KXBTC15M): shortest-duration contracts available on Kalshi
 """
 import os
 import sys
@@ -266,42 +266,60 @@ async def get_orderbook_signal(client: KalshiClient, ticker: str) -> dict:
                 "yes_ask_cents": 50, "no_ask_cents": 50}
 
 
-# ─── 5-MINUTE CONTRACT FINDER ────────────────────────────────────
-async def find_5min_btc_contracts(client: KalshiClient) -> list:
+# ─── 15-MINUTE CONTRACT FINDER ───────────────────────────────────
+async def find_btc_contracts(client: KalshiClient) -> list:
     """Find the shortest-duration BTC contracts available.
-    Tries 5-minute series first, then falls back to contracts
-    expiring within 6 minutes, then all BTC contracts."""
+    Kalshi has 15-minute markets (KXBTC15M) and daily markets (KXBTCD).
+    Prefer 15-minute contracts — they expire fast and match the momentum signal."""
     try:
-        # Try known 5-minute series tickers
-        for series in ["KXBTC5M", "KXBTC-5M", "KXBTCM5", "BTCM5", "KXBTCD", "KXBTC", "BTCD"]:
+        # KXBTC15M = confirmed 15-minute BTC up/down markets
+        # KXBTCD = confirmed daily BTC price markets (fallback only)
+        for series in ["KXBTC15M", "KXBTCD", "KXBTC"]:
             markets = await client.get_markets(series_ticker=series)
-            if markets:
-                # Filter for contracts expiring soon if this is a 5m series
-                if "5M" in series or "5m" in series or "M5" in series:
-                    print(f"  Found {len(markets)} 5-min contracts via {series}")
-                    return sorted(markets, key=lambda m: m.get("close_time") or "")
-                else:
-                    # For other series, prefer contracts expiring within 10 minutes
-                    now = datetime.now(timezone.utc)
-                    short = []
-                    for m in markets:
-                        close = m.get("close_time") or m.get("expiration_time") or ""
-                        if close:
-                            try:
-                                expiry = datetime.fromisoformat(close.replace("Z", "+00:00"))
-                                mins_left = (expiry - now).total_seconds() / 60
-                                if 0.5 < mins_left <= 10:
-                                    short.append(m)
-                            except Exception:
-                                pass
-                    if short:
-                        short.sort(key=lambda m: m.get("close_time") or "")
-                        print(f"  Found {len(short)} short-duration contracts via {series}")
-                        return short
-                    # No short-expiry found — return all sorted
-                    markets.sort(key=lambda m: m.get("close_time") or "")
-                    print(f"  Found {len(markets)} contracts via {series}")
-                    return markets
+            if not markets:
+                continue
+
+            markets.sort(key=lambda m: m.get("close_time") or "")
+
+            if series == "KXBTC15M":
+                # Filter out already-expired or just-opened (<30s left) contracts
+                now = datetime.now(timezone.utc)
+                valid = []
+                for m in markets:
+                    close = m.get("close_time") or ""
+                    if close:
+                        try:
+                            expiry = datetime.fromisoformat(close.replace("Z", "+00:00"))
+                            mins_left = (expiry - now).total_seconds() / 60
+                            if mins_left > 0.5:  # at least 30 seconds left
+                                valid.append(m)
+                        except Exception:
+                            valid.append(m)
+                    else:
+                        valid.append(m)
+                if valid:
+                    print(f"  Found {len(valid)} 15-min contracts via {series}")
+                    return valid
+
+            else:
+                # Daily/weekly fallback — prefer contracts expiring within 30 minutes
+                now = datetime.now(timezone.utc)
+                short = []
+                for m in markets:
+                    close = m.get("close_time") or m.get("expiration_time") or ""
+                    if close:
+                        try:
+                            expiry = datetime.fromisoformat(close.replace("Z", "+00:00"))
+                            mins_left = (expiry - now).total_seconds() / 60
+                            if 0.5 < mins_left <= 30:
+                                short.append(m)
+                        except Exception:
+                            pass
+                if short:
+                    short.sort(key=lambda m: m.get("close_time") or "")
+                    print(f"  ⚠️  Fell back to {series} — {len(short)} contract(s) expiring ≤30min")
+                    return short
+                print(f"  ⚠️  {series}: no short-expiry contracts, skipping")
 
         # Final fallback: scan all open markets
         markets = await client.get_markets()
@@ -323,7 +341,7 @@ async def monitor_and_exit(client: KalshiClient, ticker: str, side: str,
     """Background task: watch an open position and exit early if profit/stop is hit.
     Runs every 15 seconds for up to 280 seconds (just before 5-min expiry)."""
     check_interval = 15
-    max_runtime = 280
+    max_runtime = 830  # 13m50s — covers full 15-min contract window before expiry
     start = time.time()
 
     print(f"  👁 Monitoring {ticker} {side.upper()} x{qty} @ {entry_price_cents}¢")
@@ -475,7 +493,7 @@ async def execute_trade(client: KalshiClient, risk: RiskManager,
         return
 
     # 3. Find 5-minute contract
-    contracts = await find_5min_btc_contracts(client)
+    contracts = await find_btc_contracts(client)
     if not contracts:
         print("  No BTC contracts available")
         return
@@ -652,7 +670,7 @@ async def main():
                     and momentum["direction"] != "NEUTRAL"
                     and abs(momentum["change_pct"]) >= MIN_CHANGE_PCT):
                 # Get orderbook signal for the best available contract
-                contracts = await find_5min_btc_contracts(client)
+                contracts = await find_btc_contracts(client)
                 if contracts:
                     ob_signal = await get_orderbook_signal(client, contracts[0].get("ticker", ""))
                     print(f"  OB imbalance: {ob_signal['imbalance']:.2f} ({ob_signal['bias']}) "
