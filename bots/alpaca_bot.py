@@ -178,14 +178,15 @@ def analyze_technicals(bars: list) -> dict:
     signals = {
         "price_above_ema20": current_price > ema20_val,
         "ema20_above_ema50": ema20_val > ema50_val,
-        "rsi_in_range": 50 <= rsi <= 75,
+        "rsi_in_range": 40 <= rsi <= 80,   # widened from 50-75 to allow corrections
         "macd_positive": macd["macd"] > macd["signal"] and macd["histogram"] > 0,
         "volume_surge": volume_ratio >= 1.5,
     }
 
     score = sum(signals.values()) / len(signals)
-    # Require 4 of 5 signals (volume surge is a bonus, not a requirement)
-    required = ["price_above_ema20", "ema20_above_ema50", "rsi_in_range", "macd_positive"]
+    # Require price>ema20, rsi_in_range, macd_positive — ema20>ema50 counts but not required
+    # (allows trading during market corrections where golden cross hasn't formed yet)
+    required = ["price_above_ema20", "rsi_in_range", "macd_positive"]
     required_pass = all(signals[k] for k in required)
 
     return {
@@ -226,7 +227,14 @@ async def check_market_regime(client: AlpacaClient) -> dict:
 
 
 # ─── MAIN TRADING LOOP ───────────────────────────────────────────
-WATCHLIST = ["AAPL", "NVDA", "TSLA", "MSFT", "AMZN", "META", "GOOGL", "AMD"]
+WATCHLIST = [
+    # Mega-cap tech
+    "AAPL", "NVDA", "MSFT", "META", "GOOGL", "AMZN",
+    # Momentum / growth
+    "TSLA", "AMD", "PLTR", "UBER",
+    # Defensive / non-correlated (still trade in corrections)
+    "GLD", "XOM", "JPM", "UNH",
+]
 
 async def run_scan_cycle(client: AlpacaClient, risk: RiskManager):
     """One complete scan cycle: check regime, scan watchlist, execute entries."""
@@ -294,14 +302,17 @@ async def run_scan_cycle(client: AlpacaClient, risk: RiskManager):
                 print(f"  [{ticker}] Technicals FAIL — skipping")
                 continue
 
-            # 2. Perplexity sentiment
+            # 2. Perplexity sentiment (optional — if API key missing, default to neutral)
             research = await query_perplexity(f"{ticker} stock sentiment news catalyst this week")
+            sentiment_configured = research.get("summary") != "Perplexity API key not configured"
+            if not sentiment_configured:
+                research["score"] = 0.5  # neutral — don't block on missing key
             log_signal(ticker, "SENTIMENT",
                        research["sentiment"].upper(),
                        (research["score"] + 1) / 2, {"summary": research["summary"]})
 
-            if research["score"] < 0.4:
-                print(f"  [{ticker}] Sentiment below threshold ({research['score']:.2f})")
+            if research["score"] < 0.2:  # only block on clearly negative sentiment
+                print(f"  [{ticker}] Negative sentiment ({research['score']:.2f}) — skipping")
                 continue
 
             # 3. All signals aligned — calculate position size
