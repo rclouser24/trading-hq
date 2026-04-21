@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.shared import (
     KALSHI_KEY_ID, KALSHI_PRIVATE_KEY,
     supabase, log_trade, update_trade, log_equity, get_bot_state, update_bot_state,
-    update_pnl, send_alert, RiskManager, query_perplexity, AdaptiveParams,
+    update_pnl, send_alert, RiskManager, AdaptiveParams,
 )
 
 BOT_ID = "kalshi_btc"
