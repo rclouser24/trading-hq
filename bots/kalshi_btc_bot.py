@@ -177,28 +177,50 @@ class BinanceLiveFeed:
                             now = time.time()
                             self.price = price
                             self.price_history.append((now, price))
-                            # Keep last 30 minutes
-                            cutoff = now - 1800
+                            # Keep last 45 minutes (need 2x lookback for prior-window signal)
+                            cutoff = now - 2700
                             self.price_history = [(t, p) for t, p in self.price_history if t > cutoff]
             except Exception as e:
                 print(f"  Binance WS disconnected: {e} — reconnecting in 5s")
                 await asyncio.sleep(5)
 
     def get_momentum(self, lookback_seconds: int = 900) -> dict:
-        """Compute momentum over lookback_seconds using live price history."""
+        """Compute momentum using the PRIOR window, not the current one.
+
+        Problem with measuring the current 15-min window: the move has already
+        happened and is priced into the contract. Betting UP after BTC already
+        ran means paying 70c+ for a contract that will mean-revert.
+
+        Instead: measure the window BEFORE the current contract opened (i.e.
+        15-30 minutes ago) as the trend signal for the NEXT 15 minutes.
+        This is trend continuation: prior window UP → current window likely UP.
+        """
         if len(self.price_history) < 2 or self.price == 0:
             return {"direction": "NEUTRAL", "change_pct": 0, "confidence": 0.5,
                     "current_price": self.price}
 
-        cutoff = time.time() - lookback_seconds
-        recent = [(t, p) for t, p in self.price_history if t > cutoff]
-        if len(recent) < 2:
-            recent = self.price_history[-2:]
+        now = time.time()
+        window = lookback_seconds  # e.g. 900s = 15 min
 
-        start_price = recent[0][1]
-        end_price = recent[-1][1]
-        change_pct = ((end_price - start_price) / start_price) * 100
-        abs_change = abs(change_pct)
+        # Prior window: from 2x lookback ago to 1x lookback ago
+        prior_start_cutoff = now - (window * 2)
+        prior_end_cutoff   = now - window
+
+        prior = [(t, p) for t, p in self.price_history
+                 if prior_start_cutoff <= t <= prior_end_cutoff]
+
+        if len(prior) < 2:
+            # Not enough history yet — fall back to last 2 points in the prior range
+            all_prior = [(t, p) for t, p in self.price_history if t <= prior_end_cutoff]
+            if len(all_prior) < 2:
+                return {"direction": "NEUTRAL", "change_pct": 0, "confidence": 0.5,
+                        "current_price": self.price}
+            prior = all_prior[-2:]
+
+        start_price = prior[0][1]
+        end_price   = prior[-1][1]
+        change_pct  = ((end_price - start_price) / start_price) * 100
+        abs_change  = abs(change_pct)
 
         if abs_change > 0.5:
             confidence = min(0.95, 0.6 + abs_change * 0.2)
@@ -213,8 +235,9 @@ class BinanceLiveFeed:
             "direction": direction,
             "change_pct": round(change_pct, 4),
             "confidence": round(confidence, 3),
-            "current_price": end_price,
+            "current_price": self.price,
             "start_price": start_price,
+            "signal_price": end_price,  # price at start of current window
         }
 
 
