@@ -29,11 +29,13 @@ from config.shared import (
 
 BOT_ID = "kalshi_btc"
 KALSHI_API_URL = "https://api.elections.kalshi.com/trade-api/v2"
-TRADE_COOLDOWN_S = 300      # Minimum seconds between new entries
-PROFIT_TARGET   = 0.35      # Exit if contract price moves +35% in our favor
-STOP_LOSS       = 0.30      # Exit if contract price moves -30% against us
-MIN_CHANGE_PCT  = 0.20      # BTC must have moved at least 0.20% to consider entry
-MAX_DAILY_TRADES = 10       # Hard cap — protect $10 balance from over-trading
+TRADE_COOLDOWN_S  = 300     # Minimum seconds between new entries
+PROFIT_TARGET     = 0.35    # Exit if contract price moves +35% in our favor
+STOP_LOSS         = 0.30    # Exit if contract price moves -30% against us
+MIN_CHANGE_PCT    = 0.20    # BTC prior-window move must be at least 0.20%
+MAX_DAILY_TRADES  = 10      # Hard cap — protect $10 balance from over-trading
+MIN_DETECT_GAP_PCT = 3.0    # Kalshi must lag Binance implied prob by ≥3pp to flag
+MIN_TRADE_EDGE_PCT = 5.0    # Edge must be ≥5% to actually execute (tweet threshold)
 _last_trade_time = 0
 _daily_trade_count = 0
 _daily_trade_date = ""
@@ -487,6 +489,27 @@ async def settle_trades(client: KalshiClient, adaptive: AdaptiveParams):
         print(f"  Settlement error: {e}")
 
 
+# ─── CEX-IMPLIED PROBABILITY ─────────────────────────────────────
+def calculate_implied_prob(momentum: dict) -> float:
+    """Convert BTC prior-window momentum into an implied win probability.
+
+    This is what Binance price action says the contract SHOULD be priced at.
+    We compare this to what Kalshi is actually pricing to find the gap.
+
+    Strong move (>0.5%) → 80% implied; moderate (>0.3%) → 70%;
+    mild (>0.2%) → 62%; weak → 55% (barely above coin flip).
+    """
+    abs_change = abs(momentum.get("change_pct", 0))
+    if abs_change > 0.5:
+        return 0.80
+    elif abs_change > 0.3:
+        return 0.70
+    elif abs_change > 0.2:
+        return 0.62
+    else:
+        return 0.55
+
+
 # ─── TRADING LOGIC ────────────────────────────────────────────────
 async def execute_trade(client: KalshiClient, risk: RiskManager,
                          momentum: dict, ob_signal: dict, balance: float):
@@ -548,6 +571,25 @@ async def execute_trade(client: KalshiClient, risk: RiskManager,
     else:
         entry_cents = ob_signal.get("no_ask_cents", 50)
     entry_price = entry_cents / 100
+    kalshi_price = entry_price  # what Kalshi is currently charging
+
+    # 6a. CEX vs Kalshi gap check (tweet strategy #2 and #4)
+    # implied_prob = what Binance momentum says the contract SHOULD be worth
+    # gap = how much Kalshi is underpricing it (the exploitable lag)
+    implied_prob = calculate_implied_prob(momentum)
+    gap_pct = (implied_prob - kalshi_price) * 100  # in percentage points
+
+    print(f"  📐 Implied prob: {implied_prob:.0%} | Kalshi price: {kalshi_price:.0%} "
+          f"| Gap: {gap_pct:+.1f}pp | Need ≥{MIN_TRADE_EDGE_PCT}pp to trade")
+
+    if gap_pct < MIN_DETECT_GAP_PCT:
+        print(f"  ⏭  Kalshi already priced in — gap {gap_pct:.1f}pp < {MIN_DETECT_GAP_PCT}pp, skipping")
+        return
+    if gap_pct < MIN_TRADE_EDGE_PCT:
+        print(f"  ⏭  Gap {gap_pct:.1f}pp detected but below execution threshold {MIN_TRADE_EDGE_PCT}pp, skipping")
+        return
+
+    print(f"  ✅ EDGE FOUND: {gap_pct:.1f}pp gap — Kalshi lagging Binance")
 
     # 7. Position size — capped at 3 contracts with $10 balance
     position_dollars = risk.calculate_position_size(

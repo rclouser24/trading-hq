@@ -267,9 +267,9 @@ class AdaptiveParams:
 
     DEFAULTS = {
         "kalshi_btc": {
-            "confidence_threshold": 0.55,
+            "confidence_threshold": 0.65,  # raised from 0.55 — edge/gap gates now do primary filtering
             "lookback_minutes": 15,
-            "min_change_pct": 0.05,
+            "min_change_pct": 0.20,
         },
         "kalshi_arb": {
             "edge_threshold": 3.0,
