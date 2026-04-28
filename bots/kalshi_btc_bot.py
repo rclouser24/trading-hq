@@ -1,13 +1,17 @@
 """
 KALSHI BTC BOT — Directional BTC Up/Down Trading
-Strategies adopted from Polymarket research:
+Strategies adopted from Polymarket research + polymarket-trade-engine repo:
   1. Mid-window exit: sell at profit target or stop loss instead of holding to expiry
   2. Binance WebSocket: live price feed with zero polling lag
   3. Order book imbalance: YES/NO volume bias as entry confirmation
   4. Time-of-day filter: only trade during high-volatility windows
   5. 15-minute markets (KXBTC15M): shortest-duration contracts available on Kalshi
+  6. Gap signal: use current window's BTC gap vs reference price as the trend signal
+  7. Pre-enter next window: target contracts[1] at ~50c before the move happens
+  8. Emergency sell: hard exit 30s before contract expiry to avoid holding a loser
 """
 import os
+import re
 import sys
 import asyncio
 import json
@@ -362,23 +366,45 @@ async def find_btc_contracts(client: KalshiClient) -> list:
 
 # ─── MID-WINDOW POSITION MONITOR ─────────────────────────────────
 async def monitor_and_exit(client: KalshiClient, ticker: str, side: str,
-                            qty: int, entry_price_cents: int, trade_db_id: int):
-    """Background task: watch an open position and exit early if profit/stop is hit.
-    Runs every 15 seconds for up to 280 seconds (just before 5-min expiry)."""
+                            qty: int, entry_price_cents: int, trade_db_id: int,
+                            close_time_str: str = ""):
+    """Background task: watch an open position and exit early.
+    Three exit paths:
+      1. Profit target hit (+35%)
+      2. Stop loss hit (-30%)
+      3. Emergency sell: 30s before contract expiry (guaranteed exit)
+    """
     check_interval = 15
-    max_runtime = 830  # 13m50s — covers full 15-min contract window before expiry
+    max_runtime = 920   # 15m20s hard cap
     start = time.time()
 
-    print(f"  👁 Monitoring {ticker} {side.upper()} x{qty} @ {entry_price_cents}¢")
+    # Compute emergency sell deadline: 30s before contract close
+    emergency_deadline = None
+    if close_time_str:
+        try:
+            expiry = datetime.fromisoformat(close_time_str.replace("Z", "+00:00"))
+            emergency_deadline = expiry.timestamp() - 30
+            print(f"  👁 Monitoring {ticker} {side.upper()} x{qty} @ {entry_price_cents}¢ "
+                  f"| Emergency sell at T-30s ({datetime.fromtimestamp(emergency_deadline, tz=timezone.utc).strftime('%H:%M:%S')} UTC)")
+        except Exception:
+            print(f"  👁 Monitoring {ticker} {side.upper()} x{qty} @ {entry_price_cents}¢")
+    else:
+        print(f"  👁 Monitoring {ticker} {side.upper()} x{qty} @ {entry_price_cents}¢")
 
     while time.time() - start < max_runtime:
         await asyncio.sleep(check_interval)
+
+        # Emergency sell: 30s before expiry — exit at best bid regardless of P&L
+        if emergency_deadline and time.time() >= emergency_deadline:
+            print(f"  🚨 {ticker} — T-30s reached, emergency sell at best bid")
+            await _emergency_sell(client, ticker, side, qty, entry_price_cents, trade_db_id)
+            return
+
         try:
             market = await client.get_market(ticker)
             if not market:
                 continue
 
-            # Current mid-price for our side
             if side == "yes":
                 current_cents = market.get("yes_bid", entry_price_cents)
             else:
@@ -406,12 +432,44 @@ async def monitor_and_exit(client: KalshiClient, ticker: str, side: str,
         except Exception as e:
             print(f"  Monitor error: {e}")
 
-    print(f"  ⏱ {ticker} held to expiry — settlement will handle P&L")
+    print(f"  ⏱ {ticker} monitor timeout — contract should have settled")
+
+
+async def _emergency_sell(client: KalshiClient, ticker: str, side: str, qty: int,
+                           entry_cents: int, trade_db_id: int):
+    """Last-resort exit: sell at current best bid to guarantee fill before expiry."""
+    try:
+        market = await client.get_market(ticker)
+        if side == "yes":
+            bid = market.get("yes_bid", 1) if market else 1
+        else:
+            bid = market.get("no_bid", 1) if market else 1
+
+        sell_price = max(1, bid)
+        order = await client.place_order(
+            ticker=ticker, action="sell", side=side, count=qty,
+            yes_price=sell_price if side == "yes" else None,
+            no_price=sell_price if side == "no" else None,
+        )
+        print(f"  [EMERGENCY SELL RESPONSE] {order}")
+
+        exit_price = sell_price / 100
+        pnl = round((exit_price * qty) - (entry_cents / 100 * qty), 4)
+        update_trade(
+            trade_db_id,
+            status="EMERGENCY_EXIT",
+            exit_price=exit_price,
+            pnl=pnl,
+            closed_at=datetime.now(timezone.utc).isoformat(),
+        )
+        print(f"  🚨 Emergency sold {qty}x {ticker} {side.upper()} @ {sell_price}¢ | P&L: ${pnl:+.4f}")
+    except Exception as e:
+        print(f"  Emergency sell error: {e}")
 
 
 async def _sell_position(client: KalshiClient, ticker: str, side: str, qty: int,
                           current_cents: int, entry_cents: int, trade_db_id: int, reason: str):
-    """Place a limit sell order slightly below the current bid to ensure fill."""
+    """Place a limit sell slightly below current bid."""
     try:
         sell_price = max(1, current_cents - 2)
         order = await client.place_order(
@@ -423,7 +481,6 @@ async def _sell_position(client: KalshiClient, ticker: str, side: str, qty: int,
 
         exit_price = current_cents / 100
         pnl = round((exit_price * qty) - (entry_cents / 100 * qty), 4)
-
         update_trade(
             trade_db_id,
             status=reason,
@@ -489,31 +546,79 @@ async def settle_trades(client: KalshiClient, adaptive: AdaptiveParams):
         print(f"  Settlement error: {e}")
 
 
-# ─── CEX-IMPLIED PROBABILITY ─────────────────────────────────────
-def calculate_implied_prob(momentum: dict) -> float:
-    """Convert BTC prior-window momentum into an implied win probability.
+# ─── GAP SIGNAL (polymarket-trade-engine approach) ───────────────
+def parse_reference_price(contract: dict) -> float:
+    """Extract the contract's reference price (price-to-beat) from Kalshi market data.
+    Tries API fields first, then parses the dollar amount from the title."""
+    for field in ["floor_strike", "cap_strike", "strike", "strike_price"]:
+        val = contract.get(field)
+        if val and isinstance(val, (int, float)) and val > 1000:
+            return float(val)
 
-    This is what Binance price action says the contract SHOULD be priced at.
-    We compare this to what Kalshi is actually pricing to find the gap.
+    # Parse from title: "Will BTC be above $83,450.00 at 9:15 AM?"
+    title = (contract.get("title") or contract.get("subtitle") or
+             contract.get("yes_sub_title") or "")
+    match = re.search(r'\$([0-9,]+(?:\.[0-9]+)?)', title)
+    if match:
+        try:
+            return float(match.group(1).replace(",", ""))
+        except ValueError:
+            pass
+    return 0.0
 
-    Strong move (>0.5%) → 80% implied; moderate (>0.3%) → 70%;
-    mild (>0.2%) → 62%; weak → 55% (barely above coin flip).
+
+def calculate_gap_signal(btc_price: float, reference_price: float) -> dict:
+    """Compute the gap between current BTC price and the contract's reference price.
+
+    Based on the LEARNING.md table from polymarket-trade-engine:
+      gap > +$120 → 92% implied UP probability
+      gap > +$40  → 65% implied UP probability
+      gap ≈  $0   → 50% (coin flip)
+      gap < -$40  → 35% implied UP (65% for DOWN)
+      gap < -$120 → 8%  implied UP (92% for DOWN)
+
+    Returns: direction, implied_up_prob, gap_dollars
     """
-    abs_change = abs(momentum.get("change_pct", 0))
-    if abs_change > 0.5:
-        return 0.80
-    elif abs_change > 0.3:
-        return 0.70
-    elif abs_change > 0.2:
-        return 0.62
+    if reference_price <= 0 or btc_price <= 0:
+        return {"direction": "NEUTRAL", "implied_up_prob": 0.5,
+                "implied_down_prob": 0.5, "gap_dollars": 0}
+
+    gap = btc_price - reference_price
+    abs_gap = abs(gap)
+
+    if abs_gap > 120:
+        base_prob = 0.92
+    elif abs_gap > 80:
+        base_prob = 0.82
+    elif abs_gap > 40:
+        base_prob = 0.65
+    elif abs_gap > 20:
+        base_prob = 0.57
     else:
-        return 0.55
+        base_prob = 0.50
+
+    implied_up = base_prob if gap >= 0 else (1 - base_prob)
+    implied_down = 1 - implied_up
+    direction = "UP" if gap > 5 else "DOWN" if gap < -5 else "NEUTRAL"
+
+    return {
+        "direction": direction,
+        "implied_up_prob": round(implied_up, 3),
+        "implied_down_prob": round(implied_down, 3),
+        "gap_dollars": round(gap, 2),
+    }
 
 
 # ─── TRADING LOGIC ────────────────────────────────────────────────
 async def execute_trade(client: KalshiClient, risk: RiskManager,
-                         momentum: dict, ob_signal: dict, balance: float):
-    """Evaluate all signals and execute a trade with mid-window monitor."""
+                         contracts: list, btc_price: float,
+                         ob_signal: dict, balance: float):
+    """
+    Three-part strategy from polymarket-trade-engine:
+      1. GAP SIGNAL: use current window's BTC gap vs reference price as trend signal
+      2. PRE-ENTER NEXT WINDOW: place order on contracts[1] at ~50c before move happens
+      3. EMERGENCY SELL: hard exit 30s before expiry via monitor_and_exit
+    """
     global _last_trade_time, _daily_trade_count, _daily_trade_date
 
     # 0. Daily trade cap
@@ -538,67 +643,82 @@ async def execute_trade(client: KalshiClient, risk: RiskManager,
         print(f"  Cooldown active — {int(TRADE_COOLDOWN_S - elapsed)}s remaining")
         return
 
-    # 3. Find 5-minute contract
-    contracts = await find_btc_contracts(client)
-    if not contracts:
-        print("  No BTC contracts available")
+    # 3. GAP SIGNAL: read current window (contracts[0]) gap vs reference price
+    current_contract = contracts[0]
+    ref_price = parse_reference_price(current_contract)
+    gap_signal = calculate_gap_signal(btc_price, ref_price)
+
+    print(f"  📐 Gap signal: BTC ${btc_price:,.2f} vs ref ${ref_price:,.2f} "
+          f"= ${gap_signal['gap_dollars']:+,.2f} | Direction: {gap_signal['direction']} "
+          f"| Implied UP: {gap_signal['implied_up_prob']:.0%}")
+
+    if gap_signal["direction"] == "NEUTRAL":
+        print(f"  Gap too small (${gap_signal['gap_dollars']:+,.2f}) — no clear direction, skipping")
         return
 
-    contract = contracts[0]
-    ticker = contract.get("ticker", "")
-    title = contract.get("title", "").lower()
+    # 4. PRE-ENTER NEXT WINDOW: target contracts[1] if available, else current
+    if len(contracts) >= 2:
+        target_contract = contracts[1]
+        print(f"  🎯 Pre-entering NEXT window: {target_contract.get('ticker')} "
+              f"(closes {target_contract.get('close_time', 'unknown')})")
+    else:
+        target_contract = contracts[0]
+        print(f"  🎯 Only one contract available — entering current window: {target_contract.get('ticker')}")
 
-    # 4. Determine side from contract title + momentum direction
+    ticker = target_contract.get("ticker", "")
+    title = target_contract.get("title", "").lower()
+    close_time_str = target_contract.get("close_time", "")
+
+    # 5. Determine side from contract title + gap direction
     contract_asks_up = any(w in title for w in ["above", "higher", "over", "exceed"])
-    if momentum["direction"] == "UP":
+    if gap_signal["direction"] == "UP":
         side = "yes" if contract_asks_up else "no"
+        implied_prob = gap_signal["implied_up_prob"]
     else:
         side = "no" if contract_asks_up else "yes"
+        implied_prob = gap_signal["implied_down_prob"]
 
-    # 5. Order book confirmation: bias must agree or be neutral
+    # 6. Order book confirmation: bias must agree or be neutral
     ob_bias = ob_signal.get("bias", "NEUTRAL")
-    momentum_dir = momentum["direction"]
-    if ob_bias == "BULLISH" and momentum_dir == "DOWN":
-        print(f"  ⚠️ Orderbook BULLISH but momentum DOWN — conflicting signals, skipping")
+    if ob_bias == "BULLISH" and gap_signal["direction"] == "DOWN":
+        print(f"  ⚠️ Orderbook BULLISH but gap signal DOWN — conflicting, skipping")
         return
-    if ob_bias == "BEARISH" and momentum_dir == "UP":
-        print(f"  ⚠️ Orderbook BEARISH but momentum UP — conflicting signals, skipping")
+    if ob_bias == "BEARISH" and gap_signal["direction"] == "UP":
+        print(f"  ⚠️ Orderbook BEARISH but gap signal UP — conflicting, skipping")
         return
 
-    # 6. Entry price from orderbook
+    # 7. Entry price from orderbook on the TARGET contract
+    target_ob = await get_orderbook_signal(client, ticker)
     if side == "yes":
-        entry_cents = ob_signal.get("yes_ask_cents", 50)
+        entry_cents = target_ob.get("yes_ask_cents", 50)
     else:
-        entry_cents = ob_signal.get("no_ask_cents", 50)
+        entry_cents = target_ob.get("no_ask_cents", 50)
     entry_price = entry_cents / 100
-    kalshi_price = entry_price  # what Kalshi is currently charging
+    kalshi_price = entry_price
 
-    # 6a. CEX vs Kalshi gap check (tweet strategy #2 and #4)
-    # implied_prob = what Binance momentum says the contract SHOULD be worth
-    # gap = how much Kalshi is underpricing it (the exploitable lag)
-    implied_prob = calculate_implied_prob(momentum)
-    gap_pct = (implied_prob - kalshi_price) * 100  # in percentage points
+    # 8. Edge check: gap between implied prob and Kalshi asking price
+    edge_pct = (implied_prob - kalshi_price) * 100
 
-    print(f"  📐 Implied prob: {implied_prob:.0%} | Kalshi price: {kalshi_price:.0%} "
-          f"| Gap: {gap_pct:+.1f}pp | Need ≥{MIN_TRADE_EDGE_PCT}pp to trade")
+    print(f"  📐 Implied: {implied_prob:.0%} | Kalshi asks: {kalshi_price:.0%} "
+          f"| Edge: {edge_pct:+.1f}pp | Need ≥{MIN_TRADE_EDGE_PCT}pp")
 
-    if gap_pct < MIN_DETECT_GAP_PCT:
-        print(f"  ⏭  Kalshi already priced in — gap {gap_pct:.1f}pp < {MIN_DETECT_GAP_PCT}pp, skipping")
+    if edge_pct < MIN_DETECT_GAP_PCT:
+        print(f"  ⏭  Kalshi already priced in — edge {edge_pct:.1f}pp < {MIN_DETECT_GAP_PCT}pp, skipping")
         return
-    if gap_pct < MIN_TRADE_EDGE_PCT:
-        print(f"  ⏭  Gap {gap_pct:.1f}pp detected but below execution threshold {MIN_TRADE_EDGE_PCT}pp, skipping")
+    if edge_pct < MIN_TRADE_EDGE_PCT:
+        print(f"  ⏭  Edge {edge_pct:.1f}pp below execution threshold {MIN_TRADE_EDGE_PCT}pp, skipping")
         return
 
-    print(f"  ✅ EDGE FOUND: {gap_pct:.1f}pp gap — Kalshi lagging Binance")
+    print(f"  ✅ EDGE FOUND: {edge_pct:.1f}pp — entering {ticker} {side.upper()}")
 
-    # 7. Position size — capped at 3 contracts with $10 balance
+    # 9. Position size
     position_dollars = risk.calculate_position_size(
-        balance, conviction=momentum["confidence"],
+        balance, conviction=implied_prob,
         win_rate=0.58, avg_win=0.80, avg_loss=1.0,
     )
     contracts_count = max(1, min(3, int(position_dollars)))
 
-    # 8. Place order
+    # 10. Place order
     try:
         order = await client.place_order(
             ticker=ticker, action="buy", side=side, count=contracts_count,
@@ -618,44 +738,45 @@ async def execute_trade(client: KalshiClient, risk: RiskManager,
         _daily_trade_count += 1
         print(f"  📊 Daily trades: {_daily_trade_count}/{MAX_DAILY_TRADES}")
 
-        trade_data = {
-            **momentum,
-            "order_id": order_id,
-            "ob_imbalance": ob_signal.get("imbalance"),
-            "ob_bias": ob_bias,
-        }
         log_trade(
             bot_id=BOT_ID,
             ticker=ticker,
             side=side.upper(),
             quantity=contracts_count,
             entry_price=entry_price,
-            strategy="BTC Directional",
+            strategy="BTC Gap + Pre-Entry",
             status="FILLED" if filled else order_status.upper(),
             order_type="LIMIT",
-            sentiment_score=momentum["confidence"],
+            sentiment_score=implied_prob,
             reasoning=(
-                f"BTC {momentum['direction']} {momentum['change_pct']:+.4f}% | "
-                f"Conf: {momentum['confidence']:.2f} | OB bias: {ob_bias} "
-                f"({ob_signal.get('imbalance', 0.5):.2f})"
+                f"Gap ${gap_signal['gap_dollars']:+,.2f} ({gap_signal['direction']}) | "
+                f"Implied {implied_prob:.0%} vs Kalshi {kalshi_price:.0%} | "
+                f"Edge {edge_pct:.1f}pp | OB: {ob_bias}"
             ),
-            metadata=trade_data,
+            metadata={
+                "gap_signal": gap_signal,
+                "order_id": order_id,
+                "ob_imbalance": ob_signal.get("imbalance"),
+                "ob_bias": ob_bias,
+                "ref_price": ref_price,
+                "btc_price": btc_price,
+                "pre_entry": len(contracts) >= 2,
+            },
         )
 
         print(f"  ✅ {side.upper()} {contracts_count}x {ticker} @ {entry_cents}¢ "
-              f"| BTC {momentum['direction']} {momentum['change_pct']:+.4f}% "
-              f"| OB: {ob_bias} ({ob_signal.get('imbalance', 0.5):.2f})")
+              f"| Gap ${gap_signal['gap_dollars']:+,.2f} | Edge {edge_pct:.1f}pp "
+              f"| OB: {ob_bias}")
 
-        # 9. Spawn position monitor as background task (mid-window exit)
+        # 11. Spawn position monitor with emergency sell deadline
         if filled:
-            # Get the DB trade id we just inserted
             res = supabase.table("trades").select("id").eq("bot_id", BOT_ID) \
                 .order("opened_at", desc=True).limit(1).execute()
             trade_db_id = res.data[0]["id"] if res.data else None
             if trade_db_id:
                 asyncio.create_task(
                     monitor_and_exit(client, ticker, side, contracts_count,
-                                     entry_cents, trade_db_id)
+                                     entry_cents, trade_db_id, close_time_str)
                 )
 
     except Exception as e:
@@ -675,8 +796,8 @@ async def main():
     # Start live Binance WebSocket feed as background task
     feed = BinanceLiveFeed()
     feed.start()
-    print("   Waiting 5s for WebSocket to seed price history...")
-    await asyncio.sleep(5)
+    print("   Waiting 10s for WebSocket to seed price history...")
+    await asyncio.sleep(10)
 
     # Verify Kalshi connection and write initial balance
     try:
@@ -719,36 +840,37 @@ async def main():
             await settle_trades(client, adaptive)
             params = adaptive.load()
 
-            # Get momentum from live WebSocket feed using learned lookback
-            lookback_s = params["lookback_minutes"] * 60
-            momentum = feed.get_momentum(lookback_seconds=lookback_s)
-            btc_price = momentum.get("current_price", 0)
-
+            # Live BTC price from WebSocket
+            btc_price = feed.price
             in_window = is_high_activity_hour()
-            print(f"\n[{datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC] "
-                  f"BTC: ${btc_price:,.2f} | {momentum['direction']} "
-                  f"({momentum['change_pct']:+.4f}%) | Conf: {momentum['confidence']:.2f} "
-                  f"| Threshold: {params['confidence_threshold']:.2f} "
-                  f"| Window: {'✅' if in_window else '⏸'}")
 
-            if (momentum["confidence"] >= params["confidence_threshold"]
-                    and momentum["direction"] != "NEUTRAL"
-                    and abs(momentum["change_pct"]) >= MIN_CHANGE_PCT):
-                # Get orderbook signal for the best available contract
-                contracts = await find_btc_contracts(client)
-                if contracts:
-                    ob_signal = await get_orderbook_signal(client, contracts[0].get("ticker", ""))
-                    print(f"  OB imbalance: {ob_signal['imbalance']:.2f} ({ob_signal['bias']}) "
-                          f"| YES: {ob_signal.get('yes_vol', 0)} / NO: {ob_signal.get('no_vol', 0)}")
-                    await execute_trade(client, risk, momentum, ob_signal, balance)
-                else:
-                    print("  No contracts found for orderbook check")
-            elif momentum["direction"] == "NEUTRAL":
-                print(f"  Momentum NEUTRAL — waiting")
-            elif abs(momentum["change_pct"]) < MIN_CHANGE_PCT:
-                print(f"  BTC move {momentum['change_pct']:+.4f}% below min {MIN_CHANGE_PCT}% — waiting")
+            print(f"\n[{datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC] "
+                  f"BTC: ${btc_price:,.2f} | Window: {'✅' if in_window else '⏸'}")
+
+            # Fetch contracts every cycle (needed for gap calculation)
+            contracts = await find_btc_contracts(client)
+            if not contracts:
+                print("  No KXBTC15M contracts found — skipping")
             else:
-                print(f"  Below confidence threshold ({momentum['confidence']:.2f} < {params['confidence_threshold']:.2f}) — waiting")
+                # Log current window gap for visibility every cycle
+                current_contract = contracts[0]
+                ref_price = parse_reference_price(current_contract)
+                gap_signal = calculate_gap_signal(btc_price, ref_price)
+                next_ticker = contracts[1].get("ticker", "none") if len(contracts) >= 2 else "none"
+                print(f"  Current: {current_contract.get('ticker')} | ref=${ref_price:,.2f} "
+                      f"| gap=${gap_signal['gap_dollars']:+,.2f} ({gap_signal['direction']}) "
+                      f"| Next window: {next_ticker}")
+
+                # Get orderbook on the current contract for OB bias
+                ob_signal = await get_orderbook_signal(client, current_contract.get("ticker", ""))
+                print(f"  OB imbalance: {ob_signal['imbalance']:.2f} ({ob_signal['bias']}) "
+                      f"| YES: {ob_signal.get('yes_vol', 0)} / NO: {ob_signal.get('no_vol', 0)}")
+
+                # Only attempt a trade when there's a directional gap signal
+                if gap_signal["direction"] != "NEUTRAL" and btc_price > 0 and ref_price > 0:
+                    await execute_trade(client, risk, contracts, btc_price, ob_signal, balance)
+                else:
+                    print(f"  Gap neutral or missing ref price — waiting")
 
         except Exception as e:
             import traceback
